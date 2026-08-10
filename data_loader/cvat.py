@@ -265,7 +265,7 @@ def _resolve_dir_names(dir_names: list[str], data_root: str, subsets: set[str]) 
             if not os.path.isdir(match):
                 continue
             rel_dir_name = os.path.relpath(match, data_root)
-            if rel_dir_name not in subsets:
+            if os.path.basename(rel_dir_name) not in subsets:
                 continue
             if rel_dir_name not in seen:
                 seen.add(rel_dir_name)
@@ -292,12 +292,17 @@ def scan_dirs(
         image_dir = os.path.join(data_root, dir_name)
         images_on_disk = _list_images(image_dir)
 
-        for name, ref in by_subset.get(dir_name, {}).items():
+        # `dir_name` may be a full (possibly shell-expanded) path, e.g.
+        # "/videos/0626/com.oculus.vrshell-...-0"; the CVAT `subset`
+        # attribute only ever holds the last path component, so look up
+        # by basename rather than the full dir_name.
+        subset_name = os.path.basename(dir_name)
+        for name, ref in by_subset.get(subset_name, {}).items():
             stem, _ext = os.path.splitext(name)
             image_path = images_on_disk.get(stem)
             if image_path is None:
                 raise FileNotFoundError(
-                    f"CVAT annotation for '{name}' (subset='{dir_name}') has no matching image in '{image_dir}'"
+                    f"CVAT annotation for '{name}' (subset='{subset_name}') has no matching image in '{image_dir}'"
                 )
             labeled.append((image_path, ref.shapes, ref.width, ref.height))
 

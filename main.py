@@ -33,8 +33,8 @@ WEBP_QUEUE_SIZE = 500
 WEBP_WRITER_THREADS = 4
 
 # Models whose output is a per-pixel softmax over multiple classes (not a
-# single-channel sigmoid). Drives --mask-format validation and --mode eval's
-# background/foreground collapse.
+# single-channel sigmoid). Drives --mask-format validation (every mode requires
+# --model/--mask-format to agree) and which train/test module handles --model.
 MULTI_CLASS_MODELS = {"unet_resnet18_mul"}
 
 
@@ -63,16 +63,19 @@ def parse_args() -> argparse.Namespace:
         choices=["binary", "cvat_5"],
         default="binary",
         help=(
-            "'binary': ./data/{dir}_mask/ grayscale mask images (default). "
-            "'cvat_5': 5-class masks parsed from --mask-path CVAT 1.1 XML file(s), "
-            "for use with --model unet_resnet18_mul."
+            "What a model's output represents, for every mode (train/test/eval alike) -- "
+            "the single source of truth for whether a --model's output needs the multi-class "
+            "collapse below. 'binary': single-channel foreground probability; training reads "
+            "./data/{dir}_mask/ grayscale mask images (default). 'cvat_5': 5-class per-pixel "
+            "softmax; training/testing parse ground truth from --mask-path CVAT 1.1 XML "
+            "file(s). Either way, requires (and is required by) --model unet_resnet18_mul."
         ),
     )
     parser.add_argument(
         "--mask-path",
         nargs="+",
         default=None,
-        help="CVAT 1.1 XML annotation file(s); required when --mask-format is 'cvat_5'",
+        help="CVAT 1.1 XML annotation file(s); required when --mode is train/test and --mask-format is 'cvat_5'",
     )
     args = parser.parse_args()
     if args.model_path is None:
@@ -86,20 +89,28 @@ def parse_args() -> argparse.Namespace:
         except ValueError:
             parser.error("--split-seed must be an integer or 'random'")
 
-    # --mask-format/--mask-path only matter for train/test (eval doesn't need masks).
+    # --model/--mask-format must agree in every mode: --mode eval uses --mask-format (not
+    # --model) to decide whether a checkpoint's output needs the multi-class collapse, so a
+    # mismatch here would silently misread a cvat_5 model's output as a binary one (or vice
+    # versa) instead of failing loudly.
+    is_multiclass_model = args.model in MULTI_CLASS_MODELS
+    if is_multiclass_model and args.mask_format != "cvat_5":
+        parser.error(f"--model {args.model} requires --mask-format cvat_5")
+    if args.mask_format == "cvat_5" and not is_multiclass_model and args.mode != "eval":
+        parser.error(
+            f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
+            f"got '{args.model}'"
+        )
+
+    # --mask-path only locates ground-truth CVAT annotations for train/test; eval has no
+    # ground truth to read, so it plays no part in --mode eval regardless of --mask-format.
     if args.mode in ("train", "test"):
-        is_multiclass_model = args.model in MULTI_CLASS_MODELS
-        if is_multiclass_model and args.mask_format != "cvat_5":
-            parser.error(f"--model {args.model} requires --mask-format cvat_5")
-        if args.mask_format == "cvat_5" and not is_multiclass_model:
-            parser.error(
-                f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
-                f"got '{args.model}'"
-            )
         if args.mask_format == "cvat_5" and not args.mask_path:
             parser.error("--mask-format cvat_5 requires --mask-path")
         if args.mask_format == "binary" and args.mask_path:
             parser.error("--mask-path is only used with --mask-format cvat_5")
+    elif args.mask_path:
+        parser.error("--mask-path is only used with --mode train/test")
 
     return args
 
@@ -143,7 +154,9 @@ def _webp_writer(q: "queue.Queue[tuple[str, np.ndarray] | None]") -> None:
         q.task_done()
 
 
-def run_eval(dirs: list[str], model_name: str, model_path: str, output_dir: str, batch_size: int = 8) -> None:
+def run_eval(
+    dirs: list[str], model_name: str, model_path: str, output_dir: str, mask_format: str, batch_size: int = 8
+) -> None:
     model = get_model_class(model_name)()
     model.load(model_path)
 
@@ -155,7 +168,11 @@ def run_eval(dirs: list[str], model_name: str, model_path: str, output_dir: str,
     # every non-background class's probability (== 1 - background
     # probability, since softmax sums to 1 per pixel). This keeps the
     # smooth-edge linear-upscale-then-threshold behavior below unchanged.
-    is_multiclass_model = model_name in MULTI_CLASS_MODELS
+    #
+    # --mask-format (validated against --model in parse_args), not --model, is the source of
+    # truth here: it's what determines the collapse below, matching how it's already the
+    # source of truth for --mode train/test.
+    is_multiclass_model = mask_format == "cvat_5"
     background_index = None
     if is_multiclass_model:
         from data_loader.cvat import CvatLabelMap
@@ -214,6 +231,24 @@ def run_eval(dirs: list[str], model_name: str, model_path: str, output_dir: str,
         frame_size: tuple[int, int] | None = None
         for tensors, batch_items, valid_mask in tqdm(loader, desc=dir_name):
             preds = model.eval(tensors) if tensors is not None else None  # (B, 1, in_H, in_W) probabilities in [0, 1]
+            if preds is not None:
+                # The checkpoint's actual channel count is ground truth; --mask-format is only
+                # a human-supplied claim about it. If they disagree, the collapse below would
+                # silently read the wrong channel as a foreground probability (e.g. reading a
+                # cvat_5 model's raw background-class channel as if it were already a fg
+                # probability) instead of failing loudly, so catch the mismatch here.
+                num_channels = preds.shape[1]
+                expected = "> 1 (cvat_5)" if is_multiclass_model else "1 (binary)"
+                if is_multiclass_model and num_channels <= 1:
+                    raise RuntimeError(
+                        f"--mask-format cvat_5 but '{model_path}' only outputs {num_channels} channel(s) "
+                        f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
+                    )
+                if not is_multiclass_model and num_channels != 1:
+                    raise RuntimeError(
+                        f"--mask-format binary but '{model_path}' outputs {num_channels} channels "
+                        f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
+                    )
             if is_multiclass_model and preds is not None:
                 preds = 1.0 - preds[:, [background_index], :, :]  # (B, num_classes, ...) -> (B, 1, ...) fg probability
 
@@ -363,6 +398,7 @@ def main() -> None:
             model_name=args.model,
             model_path=args.model_path,
             output_dir=args.output_dir,
+            mask_format=args.mask_format,
             batch_size=args.batch_size,
         )
 
