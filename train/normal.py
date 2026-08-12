@@ -76,10 +76,27 @@ def run(
     lr_decrease_rate: float = 0.5,
     lr_patience: int = 3,
     split_seed: int = 42,
+    preprocessor: list[str] | None = None,
+    copy_paste_count: int | None = None,
+    copy_paste_seed: int | None = None,
 ) -> None:
     train_dataset, val_dataset = get_train_val_datasets(dirs, val_ratio=val_ratio, seed=split_seed)
     has_val = val_dataset is not None
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset) if has_val else 0}")
+    original_train_count = len(train_dataset)
+
+    if preprocessor:
+        from preprocessors import apply_preprocessors
+
+        train_dataset = apply_preprocessors(
+            train_dataset, preprocessor, copy_paste_count=copy_paste_count, copy_paste_seed=copy_paste_seed
+        )
+        print(
+            f"Train samples: {len(train_dataset)} ({original_train_count} original + "
+            f"{len(train_dataset) - original_train_count} synthetic), Val samples: {len(val_dataset) if has_val else 0}"
+        )
+    else:
+        print(f"Train samples: {original_train_count}, Val samples: {len(val_dataset) if has_val else 0}")
+
     if not has_val:
         print("No val data available: skipping validation and early stopping.")
 

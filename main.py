@@ -77,6 +77,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="CVAT 1.1 XML annotation file(s); required when --mode is train/test and --mask-format is 'cvat_5'",
     )
+    parser.add_argument(
+        "--preprocessor",
+        nargs="+",
+        default=None,
+        choices=["copy_paste"],
+        help="Train-set data-augmentation preprocessor(s) to apply, in order. Only used with --mode train.",
+    )
+    parser.add_argument(
+        "--copy-paste-count",
+        type=int,
+        default=None,
+        help="Number of synthetic copy-paste samples to add to the train set; required when --preprocessor includes copy_paste",
+    )
+    parser.add_argument(
+        "--copy-paste-seed",
+        default="random",
+        help="Integer seed for copy_paste's randomness, or 'random' to generate one; only used when --preprocessor includes copy_paste",
+    )
     args = parser.parse_args()
     if args.model_path is None:
         args.model_path = os.path.join(args.output_dir, "model.onnx")
@@ -111,6 +129,26 @@ def parse_args() -> argparse.Namespace:
             parser.error("--mask-path is only used with --mask-format cvat_5")
     elif args.mask_path:
         parser.error("--mask-path is only used with --mode train/test")
+
+    # --preprocessor only augments the train dataset built inside --mode train's
+    # run(); it plays no part in test/eval, and --copy-paste-count/--copy-paste-seed
+    # only mean anything when --preprocessor actually includes copy_paste.
+    use_copy_paste = args.preprocessor is not None and "copy_paste" in args.preprocessor
+    if args.preprocessor is not None and args.mode != "train":
+        parser.error("--preprocessor is only used with --mode train")
+    if use_copy_paste and args.copy_paste_count is None:
+        parser.error("--preprocessor copy_paste requires --copy-paste-count")
+    if args.copy_paste_count is not None and not use_copy_paste:
+        parser.error("--copy-paste-count is only used with --preprocessor copy_paste")
+    if use_copy_paste:
+        if args.copy_paste_seed == "random":
+            args.copy_paste_seed = random.randint(0, 2**31 - 1)
+            print(f"Using random copy-paste seed: {args.copy_paste_seed}")
+        else:
+            try:
+                args.copy_paste_seed = int(args.copy_paste_seed)
+            except ValueError:
+                parser.error("--copy-paste-seed must be an integer or 'random'")
 
     return args
 
@@ -359,6 +397,9 @@ def main() -> None:
                 lr_decrease_rate=args.lr_decrease_rate,
                 lr_patience=args.lr_patience,
                 split_seed=args.split_seed,
+                preprocessor=args.preprocessor,
+                copy_paste_count=args.copy_paste_count,
+                copy_paste_seed=args.copy_paste_seed,
             )
         else:
             from train.normal import run
@@ -376,6 +417,9 @@ def main() -> None:
                 lr_decrease_rate=args.lr_decrease_rate,
                 lr_patience=args.lr_patience,
                 split_seed=args.split_seed,
+                preprocessor=args.preprocessor,
+                copy_paste_count=args.copy_paste_count,
+                copy_paste_seed=args.copy_paste_seed,
             )
     elif args.mode == "test":
         if args.model in MULTI_CLASS_MODELS:
