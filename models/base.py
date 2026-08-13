@@ -33,6 +33,12 @@ class ModelBase(ABC):
     input_shape: tuple[int, int, int]
     output_shape: tuple[int, int]
 
+    # True for models built around a pretrained encoder (currently the two
+    # ResNet18-based models); drives --freeze-encoder's default and
+    # validation in main.py. 'unet' has no pretrained encoder, so this stays
+    # False there and encoder_modules() below is never called for it.
+    HAS_PRETRAINED_ENCODER: bool = False
+
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
@@ -43,6 +49,12 @@ class ModelBase(ABC):
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.criterion: Optional[nn.Module] = None
         self.session: Optional[onnxruntime.InferenceSession] = None
+        # While non-empty, train() re-applies .eval() to these modules after
+        # every self.net.train() call, so a frozen encoder's BatchNorm/
+        # LayerNorm running stats stay fixed even though the rest of the
+        # network is training. Set by train.freezing.freeze_encoder() /
+        # cleared by train.freezing.unfreeze_encoder().
+        self._frozen_encoder_modules: list[nn.Module] = []
 
     # ------------------------------------------------------------------
     # Properties
@@ -59,6 +71,15 @@ class ModelBase(ABC):
     def _build_network(self) -> nn.Module:
         """Build and return a fresh (randomly initialized) ``nn.Module``."""
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Pretrained encoder access (only for HAS_PRETRAINED_ENCODER models)
+    # ------------------------------------------------------------------
+    def encoder_modules(self) -> list[nn.Module]:
+        """Return the ``nn.Module``s making up this model's pretrained
+        encoder, for ``train.freezing`` to freeze/unfreeze. Only implemented
+        by models with ``HAS_PRETRAINED_ENCODER = True``."""
+        raise NotImplementedError(f"{type(self).__name__} has no pretrained encoder to freeze/unfreeze")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -87,6 +108,13 @@ class ModelBase(ABC):
             raise RuntimeError("Model has not been created. Call create() before train().")
 
         self.net.train()
+        # self.net.train() above recursively sets every submodule (including
+        # a frozen encoder's) back to training mode, which would let its
+        # BatchNorm/LayerNorm running stats keep drifting despite
+        # requires_grad=False. Re-pin any frozen modules to eval mode here so
+        # that doesn't happen.
+        for module in self._frozen_encoder_modules:
+            module.eval()
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
 

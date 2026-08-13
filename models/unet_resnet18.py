@@ -109,6 +109,11 @@ class UNetResNet18(ModelBase):
 
     input_shape = (180, 320, 3)  # (H, W, C)
     output_shape = (180, 320)  # (H, W)
+    HAS_PRETRAINED_ENCODER = True
 
     def _build_network(self) -> nn.Module:
         return _UNetResNet18Network(pretrained=True)
+
+    def encoder_modules(self) -> list[nn.Module]:
+        net = self.net
+        return [net.stem, net.pool, net.layer1, net.layer2, net.layer3, net.layer4]

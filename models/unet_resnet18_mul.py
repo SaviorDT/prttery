@@ -137,9 +137,14 @@ class UNetResNet18Mul(ModelBase):
     input_shape = (180, 320, 3)  # (H, W, C)
     output_shape = (NUM_CLASSES, 180, 320)  # (C, H, W)
     num_classes = NUM_CLASSES
+    HAS_PRETRAINED_ENCODER = True
 
     def _build_network(self) -> nn.Module:
         return _UNetResNet18MulNetwork(pretrained=True)
+
+    def encoder_modules(self) -> list[nn.Module]:
+        net = self.net
+        return [net.stem, net.pool, net.layer1, net.layer2, net.layer3, net.layer4]
 
     def create(self, lr: float = 1e-3) -> None:
         """Same lifecycle as ModelBase.create(), except the loss is

@@ -30,6 +30,7 @@ from tqdm import tqdm
 from data_loader.cvat import CvatLabelMap, get_test_dataset, get_train_val_datasets
 from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
 from models import get_model_class
+from train import freezing
 
 
 def compute_metrics_multiclass(pred_prob: np.ndarray, target: np.ndarray, num_classes: int) -> dict:
@@ -105,6 +106,9 @@ def run(
     preprocessor: list[str] | None = None,
     copy_paste_count: int | None = None,
     copy_paste_seed: int | None = None,
+    freeze_encoder: bool = False,
+    unfreeze_patience: int = 4,
+    encoder_lr_factor: float = 0.1,
 ) -> None:
     label_map = CvatLabelMap()
 
@@ -130,6 +134,12 @@ def run(
 
     if lr_mode == "decreasing" and not has_val:
         raise SystemExit("Error: --lr-mode decreasing requires validation data, but none is available.")
+
+    if freeze_encoder and not has_val:
+        raise SystemExit(
+            "Error: --freeze-encoder requires validation data (it unfreezes on a val-loss plateau), "
+            "but none is available. Pass --no-freeze-encoder to train directly instead."
+        )
 
     num_workers = min(4, os.cpu_count() or 1)
     pin_memory = torch.cuda.is_available()
@@ -157,10 +167,16 @@ def run(
     model = get_model_class(model_name)()
     model.create(lr=lr)
 
+    if freeze_encoder:
+        freezing.freeze_encoder(model)
+        tqdm.write(f"Encoder frozen; will unfreeze after {unfreeze_patience} epoch(s) without val-loss improvement.")
+    encoder_frozen = freeze_encoder
+
     best_val_loss = float("inf")
     best_state = None
     no_improve_count = 0
     lr_no_improve_count = 0
+    unfreeze_no_improve_count = 0
 
     for epoch in tqdm(range(1, epochs + 1), desc="Epoch"):
         current_lr = model.optimizer.param_groups[0]["lr"]
@@ -205,11 +221,35 @@ def run(
             best_state = copy.deepcopy(model.net.state_dict())
             no_improve_count = 0
             lr_no_improve_count = 0
+            unfreeze_no_improve_count = 0
             tqdm.write(f"Epoch {epoch}: val loss improved to {val_loss:.4f}, saving best weights")
         else:
             no_improve_count += 1
             lr_no_improve_count += 1
+            unfreeze_no_improve_count += 1
             tqdm.write(f"Epoch {epoch}: no improvement ({no_improve_count}/{patience})")
+
+            # Checked before lr-decay/early-stop below: unfreezing is a bigger, more disruptive
+            # change than either of those, so it gets first crack at a plateau, and resets every
+            # counter (not just its own) so lr-decay/early-stopping get a fresh window to judge
+            # the now-unfrozen model on, instead of carrying over stale frozen-phase counts. This
+            # also means unfreeze_patience == patience is safe to allow (validated in main.py as
+            # `<=`, not `<`): the first time no_improve_count would hit patience, this branch
+            # intercepts it and resets it to 0 before the early-stop check below ever sees it;
+            # only a second, post-unfreeze run to patience (with encoder_frozen now False) really
+            # stops training.
+            if encoder_frozen and unfreeze_no_improve_count >= unfreeze_patience:
+                freezing.unfreeze_encoder(model, encoder_lr_factor)
+                encoder_frozen = False
+                no_improve_count = 0
+                lr_no_improve_count = 0
+                unfreeze_no_improve_count = 0
+                decoder_lr = model.optimizer.param_groups[0]["lr"]
+                encoder_lr = model.optimizer.param_groups[-1]["lr"]
+                tqdm.write(
+                    f"Epoch {epoch}: no improvement for {unfreeze_patience} epochs, unfreezing encoder "
+                    f"(encoder lr={encoder_lr:.6g}, decoder lr={decoder_lr:.6g})"
+                )
 
             if lr_mode == "decreasing" and lr_no_improve_count >= lr_patience:
                 for param_group in model.optimizer.param_groups:

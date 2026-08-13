@@ -55,6 +55,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-decrease-rate", type=float, default=0.5, help="Used only when --lr-mode is 'decreasing'")
     parser.add_argument("--lr-patience", type=int, default=3, help="Used only when --lr-mode is 'decreasing'")
     parser.add_argument(
+        "--freeze-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Freeze the model's pretrained encoder (weights + BatchNorm/LayerNorm running stats) "
+            "at the start of training, then automatically unfreeze it once val loss goes "
+            "--unfreeze-patience epochs without improving (its post-unfreeze lr is set by "
+            "--encoder-lr-factor). Only valid for models with a pretrained encoder (unet_resnet18, "
+            "unet_resnet18_mul); defaults to on for those, off for 'unet'. Requires validation data. "
+            "Pass --no-freeze-encoder to always train directly/unfrozen regardless of --model."
+        ),
+    )
+    parser.add_argument(
+        "--unfreeze-patience",
+        type=int,
+        default=4,
+        help="Epochs without val-loss improvement before unfreezing (see --freeze-encoder); must be <= --patience",
+    )
+    parser.add_argument(
+        "--encoder-lr-factor",
+        type=float,
+        default=0.1,
+        help="Encoder's lr after unfreezing, as a fraction of the decoder's lr at that moment (see --freeze-encoder)",
+    )
+    parser.add_argument(
         "--split-seed",
         default="random",
         help="Integer seed for the train/val split, or 'random' to generate one",
@@ -144,6 +169,22 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
             f"got '{args.model}'"
+        )
+
+    # --freeze-encoder only means anything for a model with a pretrained encoder to freeze;
+    # None (neither --freeze-encoder nor --no-freeze-encoder given) resolves to "on" for those
+    # models and "off" for 'unet', so direct/unfrozen training stays 'unet's default while
+    # pretrained models opt into freeze-then-unfreeze transfer learning by default -- an explicit
+    # --no-freeze-encoder always falls back to direct training regardless of --model.
+    has_pretrained_encoder = get_model_class(args.model).HAS_PRETRAINED_ENCODER
+    if args.freeze_encoder is None:
+        args.freeze_encoder = has_pretrained_encoder
+    elif args.freeze_encoder and not has_pretrained_encoder:
+        parser.error(f"--freeze-encoder requires a model with a pretrained encoder, got '{args.model}'")
+    if args.freeze_encoder and args.unfreeze_patience > args.patience:
+        parser.error(
+            f"--unfreeze-patience ({args.unfreeze_patience}) must be <= --patience ({args.patience}); "
+            "otherwise early stopping would end training before the encoder ever gets a chance to unfreeze"
         )
 
     # --test-mask-format / --convert-mask-format only mean anything for --mode test, where
@@ -454,6 +495,9 @@ def main() -> None:
                 preprocessor=args.preprocessor,
                 copy_paste_count=args.copy_paste_count,
                 copy_paste_seed=args.copy_paste_seed,
+                freeze_encoder=args.freeze_encoder,
+                unfreeze_patience=args.unfreeze_patience,
+                encoder_lr_factor=args.encoder_lr_factor,
             )
         else:
             from train.normal import run
@@ -474,6 +518,9 @@ def main() -> None:
                 preprocessor=args.preprocessor,
                 copy_paste_count=args.copy_paste_count,
                 copy_paste_seed=args.copy_paste_seed,
+                freeze_encoder=args.freeze_encoder,
+                unfreeze_patience=args.unfreeze_patience,
+                encoder_lr_factor=args.encoder_lr_factor,
             )
     elif args.mode == "test":
         if args.model in MULTI_CLASS_MODELS:
