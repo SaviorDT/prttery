@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=["unet", "unet_resnet18", "unet_resnet18_mul"], default="unet_resnet18_mul")
     parser.add_argument("--dirs", nargs="+", required=True, help="Folder names under ./data")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--output-dir", default="./result", help="Directory for outputs (model, videos, frames)")
     parser.add_argument("--model-path", default=None, help="Defaults to '{output-dir}/model.onnx'")
