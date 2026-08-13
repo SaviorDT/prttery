@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data_loader.cvat import CvatLabelMap, get_test_dataset, get_train_val_datasets
+from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
 from models import get_model_class
 
 
@@ -63,26 +64,7 @@ def compute_metrics_fg(pred_prob: np.ndarray, target: np.ndarray, background_ind
     """
     pred = (np.argmax(pred_prob, axis=1) != background_index).astype(np.float32)
     tgt = (target != background_index).astype(np.float32)
-
-    tp = float(np.sum((pred == 1) & (tgt == 1)))
-    tn = float(np.sum((pred == 0) & (tgt == 0)))
-    fp = float(np.sum((pred == 1) & (tgt == 0)))
-    fn = float(np.sum((pred == 0) & (tgt == 1)))
-
-    eps = 1e-7
-    accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
-    iou = tp / (tp + fp + fn + eps)
-    precision = tp / (tp + fp + eps)
-    recall = tp / (tp + fn + eps)
-    f1 = 2 * precision * recall / (precision + recall + eps)
-
-    return {
-        "accuracy": accuracy,
-        "iou": iou,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-    }
+    return binary_confusion_metrics(pred, tgt)
 
 
 def _nll_loss(pred_prob: np.ndarray, target: np.ndarray, eps: float = 1e-7) -> float:
@@ -271,11 +253,37 @@ def run(
     print(f"Model saved to {model_path}")
 
 
-def run_test(dirs: list[str], mask_paths: list[str], model_path: str, model_name: str = "unet_resnet18_mul", batch_size: int = 8) -> None:
-    """Evaluate a saved model against all labeled data (train and val combined)."""
-    label_map = CvatLabelMap()
+def run_test(
+    dirs: list[str],
+    mask_paths: list[str] | None,
+    model_path: str,
+    model_name: str = "unet_resnet18_mul",
+    batch_size: int = 8,
+    test_mask_format: str = "cvat_5",
+    convert_mask_format: str | None = None,
+) -> None:
+    """Evaluate a saved model (native format: cvat_5) against all labeled data
+    (train and val combined).
 
-    test_dataset = get_test_dataset(dirs, mask_paths)
+    Ground truth is normally cvat_5, parsed from ``mask_paths`` as usual. If
+    ``test_mask_format`` is ``'binary'`` instead -- the test set's ground
+    truth is only available as binary masks -- it's loaded via
+    ``data_loader.normal`` instead, and both it and the model's (native
+    cvat_5) prediction are collapsed into ``convert_mask_format`` (currently
+    only ``'binary'`` is supported) before being compared, since the usual
+    per-class/foreground metrics below assume cvat_5 ground truth.
+    main.py's argument parsing guarantees ``convert_mask_format`` is set
+    whenever ``test_mask_format`` differs from this module's native format.
+    """
+    label_map = CvatLabelMap()
+    native_format = "cvat_5"
+
+    if test_mask_format == native_format:
+        test_dataset = get_test_dataset(dirs, mask_paths)
+    else:
+        from data_loader.normal import get_test_dataset as get_binary_test_dataset
+
+        test_dataset = get_binary_test_dataset(dirs)
     print(f"Test samples: {len(test_dataset)}")
 
     num_workers = min(4, os.cpu_count() or 1)
@@ -291,20 +299,39 @@ def run_test(dirs: list[str], mask_paths: list[str], model_path: str, model_name
     model = get_model_class(model_name)()
     model.load(model_path)
 
+    same_format = test_mask_format == native_format
     test_losses = []
     test_metrics_main = []
     test_metrics_fg = []
+    test_metrics_converted = []
     for x, y in tqdm(test_loader, desc="Test"):
         pred = model.eval(x)
         y_np = y.numpy()
-        test_losses.append(_nll_loss(pred, y_np))
-        test_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
-        test_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
 
-    test_loss = float(np.mean(test_losses))
+        if same_format:
+            test_losses.append(_nll_loss(pred, y_np))
+            test_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
+            test_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
+        else:
+            if convert_mask_format != "binary":
+                raise ValueError(f"Unsupported --convert-mask-format '{convert_mask_format}'; only 'binary' is supported")
+            # Ground truth doesn't carry per-class labels in this branch (it's
+            # binary), so the per-class/mean-IoU breakdown above isn't
+            # meaningful here and is skipped -- only the converted binary
+            # metrics are reported. Loss is skipped too, for the same reason.
+            pred_class_idx = get_mask_format(native_format).raw_output_to_class_index(pred)
+            gt_class_idx = get_mask_format(test_mask_format).ground_truth_to_class_index(y_np)
+            pred_binary = to_binary(pred_class_idx, native_format)
+            gt_binary = to_binary(gt_class_idx, test_mask_format)
+            test_metrics_converted.append(binary_confusion_metrics(pred_binary, gt_binary))
+
     print()
     print("=" * 60)
     print("Test Metrics")
-    print(_format_metrics("test", test_loss, _average_metrics(test_metrics_main)))
-    print(_format_metrics("test-fg", None, _average_metrics(test_metrics_fg)))
+    if same_format:
+        test_loss = float(np.mean(test_losses))
+        print(_format_metrics("test", test_loss, _average_metrics(test_metrics_main)))
+        print(_format_metrics("test-fg", None, _average_metrics(test_metrics_fg)))
+    else:
+        print(_format_metrics("test", None, _average_metrics(test_metrics_converted)))
     print("=" * 60)

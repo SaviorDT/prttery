@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data_loader.normal import EvalDataset, EvalItem, eval_collate, get_eval_items
+from mask_formats import get_mask_format, to_binary
 from models import get_model_class
 from outputer.mp4 import close_nvenc_writer, open_nvenc_writer, probe_nvenc_available, write_nvenc_frame, write_video
 
@@ -75,7 +76,32 @@ def parse_args() -> argparse.Namespace:
         "--mask-path",
         nargs="+",
         default=None,
-        help="CVAT 1.1 XML annotation file(s); required when --mode is train/test and --mask-format is 'cvat_5'",
+        help=(
+            "CVAT 1.1 XML annotation file(s); required when --mode is train/test and "
+            "--mask-format is 'cvat_5', or when --mode is test and --test-mask-format is 'cvat_5'"
+        ),
+    )
+    parser.add_argument(
+        "--test-mask-format",
+        choices=["binary", "cvat_5"],
+        default=None,
+        help=(
+            "Format of the --mode test ground-truth masks on disk, if different from "
+            "--mask-format (which continues to describe the model's own native format). "
+            "Defaults to --mask-format when omitted. Only used with --mode test; if it differs "
+            "from --mask-format, --convert-mask-format must also be given."
+        ),
+    )
+    parser.add_argument(
+        "--convert-mask-format",
+        choices=["binary"],
+        default=None,
+        help=(
+            "Convert both the test-set ground truth and the model's prediction into this format "
+            "before computing --mode test metrics, regardless of whether they already match "
+            "(when they do match, per-format metrics are reported as usual unless this is set). "
+            "Currently only 'binary' is supported. Only used with --mode test."
+        ),
     )
     parser.add_argument(
         "--preprocessor",
@@ -120,13 +146,44 @@ def parse_args() -> argparse.Namespace:
             f"got '{args.model}'"
         )
 
+    # --test-mask-format / --convert-mask-format only mean anything for --mode test, where
+    # ground-truth masks (--test-mask-format) get compared against a model's prediction
+    # (native --mask-format), optionally through a common --convert-mask-format.
+    if args.test_mask_format is not None and args.mode != "test":
+        parser.error("--test-mask-format is only used with --mode test")
+    if args.convert_mask_format is not None and args.mode != "test":
+        parser.error("--convert-mask-format is only used with --mode test")
+    if args.test_mask_format is None:
+        args.test_mask_format = args.mask_format
+    if args.mode == "test" and args.test_mask_format != args.mask_format and args.convert_mask_format is None:
+        parser.error(
+            f"--test-mask-format {args.test_mask_format} differs from --mask-format {args.mask_format}; "
+            "specify --convert-mask-format to say what format to compare them in"
+        )
+
     # --mask-path only locates ground-truth CVAT annotations for train/test; eval has no
     # ground truth to read, so it plays no part in --mode eval regardless of --mask-format.
-    if args.mode in ("train", "test"):
-        if args.mask_format == "cvat_5" and not args.mask_path:
+    # Which flag decides "is the ground truth actually cvat_5" differs by mode: --mode train
+    # always reads it via --mask-format (there's no --test-mask-format there); --mode test
+    # reads ground truth via --test-mask-format specifically (defaulted above to
+    # --mask-format when not given), regardless of the model's own native --mask-format.
+    if args.mode == "train":
+        needs_cvat_path = args.mask_format == "cvat_5"
+    elif args.mode == "test":
+        needs_cvat_path = args.test_mask_format == "cvat_5"
+    else:
+        needs_cvat_path = False
+
+    if args.mode == "train":
+        if needs_cvat_path and not args.mask_path:
             parser.error("--mask-format cvat_5 requires --mask-path")
-        if args.mask_format == "binary" and args.mask_path:
-            parser.error("--mask-path is only used with --mask-format cvat_5")
+        if not needs_cvat_path and args.mask_path:
+            parser.error("--mask-path is only used when --mask-format is 'cvat_5'")
+    elif args.mode == "test":
+        if needs_cvat_path and not args.mask_path:
+            parser.error("--test-mask-format cvat_5 requires --mask-path")
+        if not needs_cvat_path and args.mask_path:
+            parser.error("--mask-path is only used when --test-mask-format is 'cvat_5'")
     elif args.mask_path:
         parser.error("--mask-path is only used with --mode train/test")
 
@@ -202,20 +259,18 @@ def run_eval(
 
     # A multi-class model's raw output is (B, num_classes, H, W) softmax
     # probabilities. Output format here stays the same alpha-matte pipeline
-    # as the binary models: collapse to a foreground probability by summing
-    # every non-background class's probability (== 1 - background
-    # probability, since softmax sums to 1 per pixel). This keeps the
-    # smooth-edge linear-upscale-then-threshold behavior below unchanged.
+    # as the binary models: collapse each pixel to its argmax class, then to
+    # a binary foreground/background decision (background -> 0, else -> 1),
+    # matching the same argmax-based collapse --mode test uses for
+    # --convert-mask-format. Note this makes the collapse a discrete decision
+    # at the model's native resolution (not a continuous probability), so the
+    # alpha edges below lose some of the smoothing the linear upscale used to
+    # give a continuous foreground probability.
     #
     # --mask-format (validated against --model in parse_args), not --model, is the source of
     # truth here: it's what determines the collapse below, matching how it's already the
     # source of truth for --mode train/test.
     is_multiclass_model = mask_format == "cvat_5"
-    background_index = None
-    if is_multiclass_model:
-        from data_loader.cvat import CvatLabelMap
-
-        background_index = CvatLabelMap().background_index
 
     items_by_dir = get_eval_items(dirs)
 
@@ -288,7 +343,8 @@ def run_eval(
                         f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
                     )
             if is_multiclass_model and preds is not None:
-                preds = 1.0 - preds[:, [background_index], :, :]  # (B, num_classes, ...) -> (B, 1, ...) fg probability
+                class_idx = get_mask_format("cvat_5").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
+                preds = to_binary(class_idx, "cvat_5")[:, np.newaxis, :, :]  # (B, H, W) -> (B, 1, H, W) in {0., 1.}
 
             valid_idx = 0
             for item, is_valid in zip(batch_items, valid_mask):
@@ -431,11 +487,21 @@ def main() -> None:
                 model_name=args.model,
                 model_path=args.model_path,
                 batch_size=args.batch_size,
+                test_mask_format=args.test_mask_format,
+                convert_mask_format=args.convert_mask_format,
             )
         else:
             from train.normal import run_test
 
-            run_test(dirs=args.dirs, model_name=args.model, model_path=args.model_path, batch_size=args.batch_size)
+            run_test(
+                dirs=args.dirs,
+                mask_paths=args.mask_path,
+                model_name=args.model,
+                model_path=args.model_path,
+                batch_size=args.batch_size,
+                test_mask_format=args.test_mask_format,
+                convert_mask_format=args.convert_mask_format,
+            )
     else:
         run_eval(
             dirs=args.dirs,
