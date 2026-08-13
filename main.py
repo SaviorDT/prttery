@@ -42,16 +42,16 @@ MULTI_CLASS_MODELS = {"unet_resnet18_mul"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="UNet background removal")
     parser.add_argument("--mode", choices=["train", "eval", "test"], required=True)
-    parser.add_argument("--model", choices=["unet", "unet_resnet18", "unet_resnet18_mul"], default="unet")
+    parser.add_argument("--model", choices=["unet", "unet_resnet18", "unet_resnet18_mul"], default="unet_resnet18_mul")
     parser.add_argument("--dirs", nargs="+", required=True, help="Folder names under ./data")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--output-dir", default="./result", help="Directory for outputs (model, videos, frames)")
     parser.add_argument("--model-path", default=None, help="Defaults to '{output-dir}/model.onnx'")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--lr-mode", choices=["default", "decreasing"], default="default")
+    parser.add_argument("--lr-mode", choices=["default", "decreasing"], default="decreasing")
     parser.add_argument("--lr-decrease-rate", type=float, default=0.5, help="Used only when --lr-mode is 'decreasing'")
     parser.add_argument("--lr-patience", type=int, default=3, help="Used only when --lr-mode is 'decreasing'")
     parser.add_argument(
@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mask-format",
         choices=["binary", "cvat_5"],
-        default="binary",
+        default="cvat_5",
         help=(
             "What a model's output represents, for every mode (train/test/eval alike) -- "
             "the single source of truth for whether a --model's output needs the multi-class "
@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--copy-paste-count",
         type=int,
-        default=None,
+        default=40,
         help="Number of synthetic copy-paste samples to add to the train set; required when --preprocessor includes copy_paste",
     )
     parser.add_argument(
@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     if args.convert_mask_format is not None and args.mode != "test":
         parser.error("--convert-mask-format is only used with --mode test")
     if args.test_mask_format is None:
-        args.test_mask_format = args.mask_format
+        args.test_mask_format = "binary"
     if args.mode == "test" and args.test_mask_format != args.mask_format and args.convert_mask_format is None:
         parser.error(
             f"--test-mask-format {args.test_mask_format} differs from --mask-format {args.mask_format}; "
@@ -195,8 +195,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--preprocessor is only used with --mode train")
     if use_copy_paste and args.copy_paste_count is None:
         parser.error("--preprocessor copy_paste requires --copy-paste-count")
-    if args.copy_paste_count is not None and not use_copy_paste:
-        parser.error("--copy-paste-count is only used with --preprocessor copy_paste")
     if use_copy_paste:
         if args.copy_paste_seed == "random":
             args.copy_paste_seed = random.randint(0, 2**31 - 1)
