@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Format of the --mode test ground-truth masks on disk, if different from "
             "--mask-format (which continues to describe the model's own native format). "
-            "Defaults to --mask-format when omitted. Only used with --mode test; if it differs "
+            "Defaults to 'binary' when omitted. Only used with --mode test; if it differs "
             "from --mask-format, --convert-mask-format must also be given."
         ),
     )
@@ -158,18 +158,23 @@ def parse_args() -> argparse.Namespace:
         except ValueError:
             parser.error("--split-seed must be an integer or 'random'")
 
-    # --model/--mask-format must agree in every mode: --mode eval uses --mask-format (not
-    # --model) to decide whether a checkpoint's output needs the multi-class collapse, so a
-    # mismatch here would silently misread a cvat_5 model's output as a binary one (or vice
-    # versa) instead of failing loudly.
+    # --model/--mask-format must agree only in --mode train, where --model determines the
+    # actual network architecture being built, so it must match what --mask-format says the
+    # ground truth/output looks like. --mode eval/test instead load a saved checkpoint from
+    # --model-path -- --model plays no architectural role there (it's only used to instantiate
+    # a wrapper for .load()/.eval(), identical across every --model choice) -- so --mask-format
+    # alone decides which code path handles a checkpoint's output, exactly as eval already did
+    # internally; --model keeps a default that's easy to forget to override, so requiring it to
+    # also agree there would reject valid eval/test invocations for no reason.
     is_multiclass_model = args.model in MULTI_CLASS_MODELS
-    if is_multiclass_model and args.mask_format != "cvat_5":
-        parser.error(f"--model {args.model} requires --mask-format cvat_5")
-    if args.mask_format == "cvat_5" and not is_multiclass_model and args.mode != "eval":
-        parser.error(
-            f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
-            f"got '{args.model}'"
-        )
+    if args.mode == "train":
+        if is_multiclass_model and args.mask_format != "cvat_5":
+            parser.error(f"--model {args.model} requires --mask-format cvat_5")
+        if args.mask_format == "cvat_5" and not is_multiclass_model:
+            parser.error(
+                f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
+                f"got '{args.model}'"
+            )
 
     # --freeze-encoder only means anything for a model with a pretrained encoder to freeze;
     # None (neither --freeze-encoder nor --no-freeze-encoder given) resolves to "on" for those
@@ -207,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     # Which flag decides "is the ground truth actually cvat_5" differs by mode: --mode train
     # always reads it via --mask-format (there's no --test-mask-format there); --mode test
     # reads ground truth via --test-mask-format specifically (defaulted above to
-    # --mask-format when not given), regardless of the model's own native --mask-format.
+    # 'binary' when not given), regardless of the model's own native --mask-format.
     if args.mode == "train":
         needs_cvat_path = args.mask_format == "cvat_5"
     elif args.mode == "test":
@@ -523,7 +528,10 @@ def main() -> None:
                 encoder_lr_factor=args.encoder_lr_factor,
             )
     elif args.mode == "test":
-        if args.model in MULTI_CLASS_MODELS:
+        # Driven by --mask-format, not --model, for the same reason the validation above only
+        # requires them to agree in --mode train: a checkpoint here comes from --model-path, and
+        # --mask-format is what actually says whether it's a multi-class or binary checkpoint.
+        if args.mask_format == "cvat_5":
             from train.multiclass import run_test
 
             run_test(
