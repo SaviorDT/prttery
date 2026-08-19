@@ -19,8 +19,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from data_loader.cvat import CvatLabelMap
 from data_loader.normal import EvalDataset, EvalItem, eval_collate, get_eval_items
-from mask_formats import get_mask_format, to_binary
+from mask_formats import get_mask_format
 from models import get_model_class
 from outputer.mp4 import close_nvenc_writer, open_nvenc_writer, probe_nvenc_available, write_nvenc_frame, write_video
 
@@ -304,17 +305,22 @@ def run_eval(
     # A multi-class model's raw output is (B, num_classes, H, W) softmax
     # probabilities. Output format here stays the same alpha-matte pipeline
     # as the binary models: collapse each pixel to its argmax class, then to
-    # a binary foreground/background decision (background -> 0, else -> 1),
-    # matching the same argmax-based collapse --mode test uses for
-    # --convert-mask-format. Note this makes the collapse a discrete decision
-    # at the model's native resolution (not a continuous probability), so the
-    # alpha edges below lose some of the smoothing the linear upscale used to
-    # give a continuous foreground probability.
+    # a binary foreground/background decision. Unlike --mode test's
+    # --convert-mask-format (which uses mask_formats.Cvat5Format's fixed
+    # background-only-is-background split), this eval-only collapse instead
+    # treats CvatLabelMap.EVAL_FOREGROUND classes as foreground and
+    # everything else (background, and any other class) as background --
+    # see CvatLabelMap.eval_foreground_indices(). Note this makes the
+    # collapse a discrete decision at the model's native resolution (not a
+    # continuous probability), so the alpha edges below lose some of the
+    # smoothing the linear upscale used to give a continuous foreground
+    # probability.
     #
     # --mask-format (validated against --model in parse_args), not --model, is the source of
     # truth here: it's what determines the collapse below, matching how it's already the
     # source of truth for --mode train/test.
     is_multiclass_model = mask_format == "cvat_5"
+    eval_foreground_indices = list(CvatLabelMap().eval_foreground_indices()) if is_multiclass_model else None
 
     items_by_dir = get_eval_items(dirs)
 
@@ -388,7 +394,8 @@ def run_eval(
                     )
             if is_multiclass_model and preds is not None:
                 class_idx = get_mask_format("cvat_5").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
-                preds = to_binary(class_idx, "cvat_5")[:, np.newaxis, :, :]  # (B, H, W) -> (B, 1, H, W) in {0., 1.}
+                # (B, H, W) -> (B, 1, H, W) in {0., 1.}: EVAL_FOREGROUND classes -> 1, else -> 0.
+                preds = np.isin(class_idx, eval_foreground_indices)[:, np.newaxis, :, :].astype(np.float32)
 
             valid_idx = 0
             for item, is_valid in zip(batch_items, valid_mask):

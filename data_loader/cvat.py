@@ -52,6 +52,13 @@ class CvatLabelMap:
     # into background rather than error or become a class of their own.
     ALIASES = {"rotate_plate_shader": "background"}
 
+    # Foreground classes for --mode eval's alpha-matte collapse only (see
+    # main.py's run_eval). Independent of BACKGROUND/background_index below,
+    # which stays a single class (render_mask's canvas fill value) and also
+    # backs train/test's fg metrics via mask_formats.Cvat5Format -- changing
+    # this list doesn't touch either of those.
+    EVAL_FOREGROUND = ["pottery", "teapot"]
+
     def __init__(self) -> None:
         self._name_to_index = {name: i for i, name in enumerate(self.CLASSES)}
 
@@ -62,6 +69,10 @@ class CvatLabelMap:
     @property
     def background_index(self) -> int:
         return self._name_to_index[self.BACKGROUND]
+
+    def eval_foreground_indices(self) -> set[int]:
+        """Class indices EVAL_FOREGROUND names -- see its docstring above."""
+        return {self.index_for(name) for name in self.EVAL_FOREGROUND}
 
     def index_for(self, label: str) -> int:
         if label in self._name_to_index:
