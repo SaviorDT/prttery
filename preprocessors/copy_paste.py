@@ -10,11 +10,11 @@ underlying dataset uses:
 
 - binary (``data_loader.normal.SegmentationDataset``): mask is ``(1, H, W)``
   float32 in {0, 1}.
-- cvat_5 (``data_loader.cvat.CvatSegmentationDataset``): mask is ``(H, W)``
+- cvat_6 (``data_loader.cvat.CvatSegmentationDataset``): mask is ``(H, W)``
   int64 class index.
 
 In both formats, pixel value 0 is always background (binary: background=0
-by definition; cvat_5: "background" is always ``CvatLabelMap.CLASSES[0]``,
+by definition; cvat_6: "background" is always ``CvatLabelMap.CLASSES[0]``,
 i.e. index 0), so any nonzero mask value is treated as a paste-able "part"
 without needing to know which dataset class produced it.
 """
@@ -175,7 +175,7 @@ def _paste_component(
 
     if mask_tgt.dim() == 3:  # binary: (1, H, W) float32
         mask_tgt[0, dst_ys_t, dst_xs_t] = float(component.class_value)
-    else:  # cvat_5: (H, W) int64 class index
+    else:  # cvat_6: (H, W) int64 class index
         mask_tgt[dst_ys_t, dst_xs_t] = int(component.class_value)
 
 

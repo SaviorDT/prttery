@@ -87,13 +87,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mask-format",
-        choices=["binary", "cvat_5"],
-        default="cvat_5",
+        choices=["binary", "cvat_6"],
+        default="cvat_6",
         help=(
             "What a model's output represents, for every mode (train/test/eval alike) -- "
             "the single source of truth for whether a --model's output needs the multi-class "
             "collapse below. 'binary': single-channel foreground probability; training reads "
-            "./data/{dir}_mask/ grayscale mask images (default). 'cvat_5': 5-class per-pixel "
+            "./data/{dir}_mask/ grayscale mask images (default). 'cvat_6': 6-class per-pixel "
             "softmax; training/testing parse ground truth from --mask-path CVAT 1.1 XML "
             "file(s). Either way, requires (and is required by) --model unet_resnet18_mul."
         ),
@@ -104,12 +104,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "CVAT 1.1 XML annotation file(s); required when --mode is train/test and "
-            "--mask-format is 'cvat_5', or when --mode is test and --test-mask-format is 'cvat_5'"
+            "--mask-format is 'cvat_6', or when --mode is test and --test-mask-format is 'cvat_6'"
         ),
     )
     parser.add_argument(
         "--test-mask-format",
-        choices=["binary", "cvat_5"],
+        choices=["binary", "cvat_6"],
         default=None,
         help=(
             "Format of the --mode test ground-truth masks on disk, if different from "
@@ -169,11 +169,11 @@ def parse_args() -> argparse.Namespace:
     # also agree there would reject valid eval/test invocations for no reason.
     is_multiclass_model = args.model in MULTI_CLASS_MODELS
     if args.mode == "train":
-        if is_multiclass_model and args.mask_format != "cvat_5":
-            parser.error(f"--model {args.model} requires --mask-format cvat_5")
-        if args.mask_format == "cvat_5" and not is_multiclass_model:
+        if is_multiclass_model and args.mask_format != "cvat_6":
+            parser.error(f"--model {args.model} requires --mask-format cvat_6")
+        if args.mask_format == "cvat_6" and not is_multiclass_model:
             parser.error(
-                f"--mask-format cvat_5 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
+                f"--mask-format cvat_6 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
                 f"got '{args.model}'"
             )
 
@@ -210,27 +210,27 @@ def parse_args() -> argparse.Namespace:
 
     # --mask-path only locates ground-truth CVAT annotations for train/test; eval has no
     # ground truth to read, so it plays no part in --mode eval regardless of --mask-format.
-    # Which flag decides "is the ground truth actually cvat_5" differs by mode: --mode train
+    # Which flag decides "is the ground truth actually cvat_6" differs by mode: --mode train
     # always reads it via --mask-format (there's no --test-mask-format there); --mode test
     # reads ground truth via --test-mask-format specifically (defaulted above to
     # 'binary' when not given), regardless of the model's own native --mask-format.
     if args.mode == "train":
-        needs_cvat_path = args.mask_format == "cvat_5"
+        needs_cvat_path = args.mask_format == "cvat_6"
     elif args.mode == "test":
-        needs_cvat_path = args.test_mask_format == "cvat_5"
+        needs_cvat_path = args.test_mask_format == "cvat_6"
     else:
         needs_cvat_path = False
 
     if args.mode == "train":
         if needs_cvat_path and not args.mask_path:
-            parser.error("--mask-format cvat_5 requires --mask-path")
+            parser.error("--mask-format cvat_6 requires --mask-path")
         if not needs_cvat_path and args.mask_path:
-            parser.error("--mask-path is only used when --mask-format is 'cvat_5'")
+            parser.error("--mask-path is only used when --mask-format is 'cvat_6'")
     elif args.mode == "test":
         if needs_cvat_path and not args.mask_path:
-            parser.error("--test-mask-format cvat_5 requires --mask-path")
+            parser.error("--test-mask-format cvat_6 requires --mask-path")
         if not needs_cvat_path and args.mask_path:
-            parser.error("--mask-path is only used when --test-mask-format is 'cvat_5'")
+            parser.error("--mask-path is only used when --test-mask-format is 'cvat_6'")
     elif args.mask_path:
         parser.error("--mask-path is only used with --mode train/test")
 
@@ -306,7 +306,7 @@ def run_eval(
     # probabilities. Output format here stays the same alpha-matte pipeline
     # as the binary models: collapse each pixel to its argmax class, then to
     # a binary foreground/background decision. Unlike --mode test's
-    # --convert-mask-format (which uses mask_formats.Cvat5Format's fixed
+    # --convert-mask-format (which uses mask_formats.Cvat6Format's fixed
     # background-only-is-background split), this eval-only collapse instead
     # treats CvatLabelMap.EVAL_FOREGROUND classes as foreground and
     # everything else (background, and any other class) as background --
@@ -319,7 +319,7 @@ def run_eval(
     # --mask-format (validated against --model in parse_args), not --model, is the source of
     # truth here: it's what determines the collapse below, matching how it's already the
     # source of truth for --mode train/test.
-    is_multiclass_model = mask_format == "cvat_5"
+    is_multiclass_model = mask_format == "cvat_6"
     eval_foreground_indices = list(CvatLabelMap().eval_foreground_indices()) if is_multiclass_model else None
 
     items_by_dir = get_eval_items(dirs)
@@ -378,13 +378,13 @@ def run_eval(
                 # The checkpoint's actual channel count is ground truth; --mask-format is only
                 # a human-supplied claim about it. If they disagree, the collapse below would
                 # silently read the wrong channel as a foreground probability (e.g. reading a
-                # cvat_5 model's raw background-class channel as if it were already a fg
+                # cvat_6 model's raw background-class channel as if it were already a fg
                 # probability) instead of failing loudly, so catch the mismatch here.
                 num_channels = preds.shape[1]
-                expected = "> 1 (cvat_5)" if is_multiclass_model else "1 (binary)"
+                expected = "> 1 (cvat_6)" if is_multiclass_model else "1 (binary)"
                 if is_multiclass_model and num_channels <= 1:
                     raise RuntimeError(
-                        f"--mask-format cvat_5 but '{model_path}' only outputs {num_channels} channel(s) "
+                        f"--mask-format cvat_6 but '{model_path}' only outputs {num_channels} channel(s) "
                         f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
                     )
                 if not is_multiclass_model and num_channels != 1:
@@ -393,7 +393,7 @@ def run_eval(
                         f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
                     )
             if is_multiclass_model and preds is not None:
-                class_idx = get_mask_format("cvat_5").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
+                class_idx = get_mask_format("cvat_6").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
                 # (B, H, W) -> (B, 1, H, W) in {0., 1.}: EVAL_FOREGROUND classes -> 1, else -> 0.
                 preds = np.isin(class_idx, eval_foreground_indices)[:, np.newaxis, :, :].astype(np.float32)
 
@@ -538,7 +538,7 @@ def main() -> None:
         # Driven by --mask-format, not --model, for the same reason the validation above only
         # requires them to agree in --mode train: a checkpoint here comes from --model-path, and
         # --mask-format is what actually says whether it's a multi-class or binary checkpoint.
-        if args.mask_format == "cvat_5":
+        if args.mask_format == "cvat_6":
             from train.multiclass import run_test
 
             run_test(

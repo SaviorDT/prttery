@@ -49,8 +49,8 @@ class BinaryFormat(MaskFormat):
         return target[:, 0, :, :].astype(np.int64)
 
 
-class Cvat5Format(MaskFormat):
-    name = "cvat_5"
+class Cvat6Format(MaskFormat):
+    name = "cvat_6"
 
     def __init__(self) -> None:
         from data_loader.cvat import CvatLabelMap
@@ -61,7 +61,7 @@ class Cvat5Format(MaskFormat):
         return {self._label_map.background_index}
 
     def raw_output_to_class_index(self, raw: np.ndarray) -> np.ndarray:
-        # (N, 5, H, W) per-pixel softmax -> (N, H, W) argmax class index.
+        # (N, 6, H, W) per-pixel softmax -> (N, H, W) argmax class index.
         return np.argmax(raw, axis=1).astype(np.int64)
 
     def ground_truth_to_class_index(self, target: np.ndarray) -> np.ndarray:
@@ -71,7 +71,7 @@ class Cvat5Format(MaskFormat):
 
 MASK_FORMATS: dict[str, MaskFormat] = {
     "binary": BinaryFormat(),
-    "cvat_5": Cvat5Format(),
+    "cvat_6": Cvat6Format(),
 }
 
 

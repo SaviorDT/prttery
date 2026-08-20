@@ -252,7 +252,7 @@ def run_test(
     (train and val combined).
 
     Ground truth is normally binary, read from ``./data/{dir}_mask/`` as
-    usual. If ``test_mask_format`` is ``'cvat_5'`` instead -- the test set's
+    usual. If ``test_mask_format`` is ``'cvat_6'`` instead -- the test set's
     ground truth is only available as CVAT annotations -- it's loaded via
     ``mask_paths`` instead, and both it and the model's (native binary)
     prediction are collapsed into ``convert_mask_format`` (currently only

@@ -101,7 +101,7 @@ class _Frame:
 
 @dataclass(frozen=True)
 class _Component:
-    class_index: int  # 1..4, never background (0)
+    class_index: int  # 1..5, never background (0)
     mask: np.ndarray  # (H, W) bool, True where this component's pixels are
 
 

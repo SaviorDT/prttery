@@ -1,4 +1,4 @@
-"""``--mask-format cvat_5`` support: 5-class masks from CVAT 1.1 XML exports.
+"""``--mask-format cvat_6`` support: 6-class masks from CVAT 1.1 XML exports.
 
 Directory convention for source frames is unchanged from ``data_loader.normal``:
 
@@ -37,7 +37,7 @@ from data_loader.normal import DATA_ROOT, _list_images
 
 
 class CvatLabelMap:
-    """Fixed label-name -> class-index mapping for the 5-class pottery task.
+    """Fixed label-name -> class-index mapping for the 6-class pottery task.
 
     Index 0 is always background. ``ALIASES`` folds known extra CVAT project
     labels (that aren't meant to be their own class) into background; any
@@ -46,7 +46,7 @@ class CvatLabelMap:
     """
 
     BACKGROUND = "background"
-    CLASSES = ["background", "pottery", "teapot", "rotate_plate", "rotate_medal"]
+    CLASSES = ["background", "pottery", "teapot", "rotate_plate", "rotate_medal", "clay_and_rotator"]
 
     # CVAT project labels known to show up in exports that should collapse
     # into background rather than error or become a class of their own.
@@ -55,9 +55,9 @@ class CvatLabelMap:
     # Foreground classes for --mode eval's alpha-matte collapse only (see
     # main.py's run_eval). Independent of BACKGROUND/background_index below,
     # which stays a single class (render_mask's canvas fill value) and also
-    # backs train/test's fg metrics via mask_formats.Cvat5Format -- changing
+    # backs train/test's fg metrics via mask_formats.Cvat6Format -- changing
     # this list doesn't touch either of those.
-    EVAL_FOREGROUND = ["pottery", "teapot"]
+    EVAL_FOREGROUND = ["pottery", "teapot", "rotate_plate", "rotate_medal", "clay_and_rotator"]
 
     def __init__(self) -> None:
         self._name_to_index = {name: i for i, name in enumerate(self.CLASSES)}
@@ -255,11 +255,11 @@ def _parse_annotations(mask_paths: list[str]) -> dict[str, dict[str, _CvatImageR
 
 
 def _resolve_dir_names(dir_names: list[str], data_root: str, subsets: set[str]) -> list[str]:
-    """Wildcard analogue of data_loader.normal._resolve_dir_names for cvat_5.
+    """Wildcard analogue of data_loader.normal._resolve_dir_names for cvat_6.
 
     A '*' entry is expanded to every directory under data_root matching the
     pattern that also appears as a subset in the given --mask-path file(s)
-    -- the cvat_5 equivalent of requiring a sibling '{name}_mask' directory.
+    -- the cvat_6 equivalent of requiring a sibling '{name}_mask' directory.
     Non-wildcard entries are passed through unchanged.
     """
     resolved: list[str] = []
@@ -321,7 +321,7 @@ def scan_dirs(
 
 
 class CvatSegmentationDataset(Dataset):
-    """Loads (image, 5-class mask) pairs, resized to the model's (H, W).
+    """Loads (image, 6-class mask) pairs, resized to the model's (H, W).
 
     Mirrors data_loader.normal.SegmentationDataset, but the mask is rendered
     on demand from CVAT shapes instead of read from a mask image file, and

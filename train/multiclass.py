@@ -1,4 +1,4 @@
-"""Training routine for multi-class (5-class) segmentation models, e.g.
+"""Training routine for multi-class (6-class) segmentation models, e.g.
 ``unet_resnet18_mul``.
 
 Deliberately parallel to (not shared with) ``train.normal``: the two paths
@@ -299,24 +299,24 @@ def run_test(
     model_path: str,
     model_name: str = "unet_resnet18_mul",
     batch_size: int = 8,
-    test_mask_format: str = "cvat_5",
+    test_mask_format: str = "cvat_6",
     convert_mask_format: str | None = None,
 ) -> None:
-    """Evaluate a saved model (native format: cvat_5) against all labeled data
+    """Evaluate a saved model (native format: cvat_6) against all labeled data
     (train and val combined).
 
-    Ground truth is normally cvat_5, parsed from ``mask_paths`` as usual. If
+    Ground truth is normally cvat_6, parsed from ``mask_paths`` as usual. If
     ``test_mask_format`` is ``'binary'`` instead -- the test set's ground
     truth is only available as binary masks -- it's loaded via
     ``data_loader.normal`` instead, and both it and the model's (native
-    cvat_5) prediction are collapsed into ``convert_mask_format`` (currently
+    cvat_6) prediction are collapsed into ``convert_mask_format`` (currently
     only ``'binary'`` is supported) before being compared, since the usual
-    per-class/foreground metrics below assume cvat_5 ground truth.
+    per-class/foreground metrics below assume cvat_6 ground truth.
     main.py's argument parsing guarantees ``convert_mask_format`` is set
     whenever ``test_mask_format`` differs from this module's native format.
     """
     label_map = CvatLabelMap()
-    native_format = "cvat_5"
+    native_format = "cvat_6"
 
     if test_mask_format == native_format:
         test_dataset = get_test_dataset(dirs, mask_paths)

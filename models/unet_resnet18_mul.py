@@ -1,14 +1,14 @@
-"""UNet with a pretrained ResNet18 encoder for 5-class pottery-part segmentation.
+"""UNet with a pretrained ResNet18 encoder for 6-class pottery-part segmentation.
 
 Same encoder/decoder architecture as ``models.unet_resnet18.UNetResNet18``,
 copied independently rather than shared/inherited (a deliberate choice, so
 the two can be tuned separately later without risking the proven binary
-background-removal model) -- only the head differs: 5 output channels
-(background, pottery, teapot, rotate_plate, rotate_medal) with a per-pixel
-softmax instead of 1 channel with a sigmoid.
+background-removal model) -- only the head differs: 6 output channels
+(background, pottery, teapot, rotate_plate, rotate_medal, clay_and_rotator)
+with a per-pixel softmax instead of 1 channel with a sigmoid.
 
 Input:  320 (W) x 180 (H) x 3 (RGB), normalized to [0, 1]
-Output: 320 (W) x 180 (H) x 5 per-pixel class probabilities (sum to 1 per pixel)
+Output: 320 (W) x 180 (H) x 6 per-pixel class probabilities (sum to 1 per pixel)
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from torchvision.models import ResNet18_Weights, resnet18
 
 from models.base import ModelBase
 
-NUM_CLASSES = 5  # background, pottery, teapot, rotate_plate, rotate_medal
+NUM_CLASSES = 6  # background, pottery, teapot, rotate_plate, rotate_medal, clay_and_rotator
 
 # ImageNet stats the pretrained ResNet18 weights were trained with.
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -47,7 +47,7 @@ class _DecoderBlock(nn.Module):
 
 class _UNetResNet18MulNetwork(nn.Module):
     """ResNet18 encoder (pretrained, fully fine-tuned) + UNet-style decoder,
-    ending in a 5-channel per-pixel softmax instead of a 1-channel sigmoid.
+    ending in a 6-channel per-pixel softmax instead of a 1-channel sigmoid.
 
     See ``models.unet_resnet18._UNetResNet18Network`` for the (identical,
     other than the head) architecture notes on normalization and
@@ -131,8 +131,8 @@ class _MulLoss(nn.Module):
 
 
 class UNetResNet18Mul(ModelBase):
-    """UNet with a pretrained ResNet18 encoder for 320x180 5-class segmentation
-    (background, pottery, teapot, rotate_plate, rotate_medal)."""
+    """UNet with a pretrained ResNet18 encoder for 320x180 6-class segmentation
+    (background, pottery, teapot, rotate_plate, rotate_medal, clay_and_rotator)."""
 
     input_shape = (180, 320, 3)  # (H, W, C)
     output_shape = (NUM_CLASSES, 180, 320)  # (C, H, W)
