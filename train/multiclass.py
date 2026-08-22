@@ -11,10 +11,11 @@ Two metric sets are reported every epoch:
 - the "main" multi-class metrics: per-class IoU (all 5 classes, including
   background), their macro average, and overall pixel accuracy;
 - a "fg" (foreground/background collapse) metric set: the argmax prediction
-  and target collapsed to non-background=positive / background=negative,
-  then the same accuracy/IoU/precision/recall/F1 shape as train.normal's
-  binary metrics -- directly comparable to the existing background-removal
-  numbers, and the same view --mode eval uses for its alpha-matte output.
+  and target collapsed to CvatLabelMap.FOREGROUND_CLASSES=positive / else
+  negative, then the same accuracy/IoU/precision/recall/F1 shape as
+  train.normal's binary metrics -- directly comparable to the existing
+  background-removal numbers, and the same collapse --mode eval uses for its
+  alpha-matte output.
 """
 
 from __future__ import annotations
@@ -57,14 +58,17 @@ def compute_metrics_multiclass(pred_prob: np.ndarray, target: np.ndarray, num_cl
     return metrics
 
 
-def compute_metrics_fg(pred_prob: np.ndarray, target: np.ndarray, background_index: int) -> dict:
+def compute_metrics_fg(pred_prob: np.ndarray, target: np.ndarray, background_indices: set[int]) -> dict:
     """Collapse the multi-class prediction/target to a binary
-    foreground(=non-background)/background view, then compute the same
-    accuracy/IoU/precision/recall/F1 as train.normal.compute_metrics --
-    directly comparable to the existing binary background-removal numbers.
+    foreground/background view -- using ``background_indices`` (see
+    CvatLabelMap.background_indices()/FOREGROUND_CLASSES) as the shared
+    definition of "background" -- then compute the same accuracy/IoU/
+    precision/recall/F1 as train.normal.compute_metrics -- directly
+    comparable to the existing binary background-removal numbers.
     """
-    pred = (np.argmax(pred_prob, axis=1) != background_index).astype(np.float32)
-    tgt = (target != background_index).astype(np.float32)
+    background = list(background_indices)
+    pred = np.isin(np.argmax(pred_prob, axis=1), background, invert=True).astype(np.float32)
+    tgt = np.isin(target, background, invert=True).astype(np.float32)
     return binary_confusion_metrics(pred, tgt)
 
 
@@ -191,7 +195,7 @@ def run(
             train_losses.append(loss)
             y_np = y.numpy()
             train_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
-            train_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
+            train_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_indices()))
 
         train_loss = float(np.mean(train_losses))
         tqdm.write(f"Epoch {epoch}/{epochs} " + _format_metrics("train", train_loss, _average_metrics(train_metrics_main)))
@@ -209,7 +213,7 @@ def run(
             y_np = y.numpy()
             val_losses.append(_nll_loss(pred, y_np))
             val_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
-            val_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
+            val_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_indices()))
 
         val_loss = float(np.mean(val_losses))
         tqdm.write(f"Epoch {epoch}/{epochs} " + _format_metrics("val", val_loss, _average_metrics(val_metrics_main)))
@@ -278,7 +282,7 @@ def run(
         y_np = y.numpy()
         final_losses.append(_nll_loss(pred, y_np))
         final_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
-        final_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
+        final_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_indices()))
 
     final_loss = float(np.mean(final_losses))
     print()
@@ -351,7 +355,7 @@ def run_test(
         if same_format:
             test_losses.append(_nll_loss(pred, y_np))
             test_metrics_main.append(compute_metrics_multiclass(pred, y_np, label_map.num_classes))
-            test_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_index))
+            test_metrics_fg.append(compute_metrics_fg(pred, y_np, label_map.background_indices()))
         else:
             if convert_mask_format != "binary":
                 raise ValueError(f"Unsupported --convert-mask-format '{convert_mask_format}'; only 'binary' is supported")

@@ -10,13 +10,33 @@ import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from data_loader.normal import get_test_dataset, get_train_val_datasets
 from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
 from models import get_model_class
 from train import freezing
+
+
+class _BinaryFromCvatDataset(Dataset):
+    """Wraps a data_loader.cvat.CvatSegmentationDataset, collapsing its
+    6-class (H, W) int64 mask into a (1, H, W) float32 {0, 1} target via
+    mask_formats.to_binary -- lets --mask-format cvat_6 --convert-mask-format
+    binary train a binary model directly off CVAT-labeled data, with no
+    separate binary-mask export and no change to the training loop below."""
+
+    def __init__(self, cvat_dataset) -> None:
+        self.cvat_dataset = cvat_dataset
+
+    def __len__(self) -> int:
+        return len(self.cvat_dataset)
+
+    def __getitem__(self, index: int):
+        image_tensor, class_index_tensor = self.cvat_dataset[index]
+        binary = to_binary(class_index_tensor.numpy(), "cvat_6")
+        mask_tensor = torch.from_numpy(binary[np.newaxis, :, :])  # (1, H, W)
+        return image_tensor, mask_tensor
 
 
 def compute_metrics(pred_prob: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> dict:
@@ -64,8 +84,22 @@ def run(
     freeze_encoder: bool = False,
     unfreeze_patience: int = 4,
     encoder_lr_factor: float = 0.1,
+    mask_format: str = "binary",
+    mask_paths: list[str] | None = None,
 ) -> None:
-    train_dataset, val_dataset = get_train_val_datasets(dirs, val_ratio=val_ratio, seed=split_seed)
+    if mask_format == "cvat_6":
+        # Ground truth is CVAT-labeled (6-class), but --convert-mask-format binary (enforced by
+        # main.py's argument parsing whenever mask_format is cvat_6 here) collapses it to binary
+        # before this binary model ever sees it -- see _BinaryFromCvatDataset above.
+        from data_loader.cvat import get_train_val_datasets as get_cvat_train_val_datasets
+
+        cvat_train_dataset, cvat_val_dataset = get_cvat_train_val_datasets(
+            dirs, mask_paths, val_ratio=val_ratio, seed=split_seed
+        )
+        train_dataset = _BinaryFromCvatDataset(cvat_train_dataset)
+        val_dataset = _BinaryFromCvatDataset(cvat_val_dataset) if cvat_val_dataset is not None else None
+    else:
+        train_dataset, val_dataset = get_train_val_datasets(dirs, val_ratio=val_ratio, seed=split_seed)
     has_val = val_dataset is not None
     original_train_count = len(train_dataset)
 

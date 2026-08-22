@@ -97,7 +97,10 @@ def parse_args() -> argparse.Namespace:
             "collapse below. 'binary': single-channel foreground probability; training reads "
             "./data/{dir}_mask/ grayscale mask images (default). 'cvat_6': 6-class per-pixel "
             "softmax; training/testing parse ground truth from --mask-path CVAT 1.1 XML "
-            "file(s). Either way, requires (and is required by) --model unet_resnet18_mul."
+            "file(s). Either way, requires (and is required by) --model unet_resnet18_mul -- "
+            "unless --mode train also passes --convert-mask-format, which collapses cvat_6 "
+            "ground truth to that format before training, so --model must instead agree with "
+            "--convert-mask-format."
         ),
     )
     parser.add_argument(
@@ -125,10 +128,14 @@ def parse_args() -> argparse.Namespace:
         choices=["binary"],
         default=None,
         help=(
-            "Convert both the test-set ground truth and the model's prediction into this format "
-            "before computing --mode test metrics, regardless of whether they already match "
-            "(when they do match, per-format metrics are reported as usual unless this is set). "
-            "Currently only 'binary' is supported. Only used with --mode test."
+            "--mode test: convert both the test-set ground truth and the model's prediction into "
+            "this format before computing metrics, regardless of whether they already match (when "
+            "they do match, per-format metrics are reported as usual unless this is set). "
+            "--mode train: collapse the --mask-format cvat_6 ground truth into this format before "
+            "training, so --model must be a model matching this format instead of --mask-format "
+            "(e.g. --mask-format cvat_6 --convert-mask-format binary trains a binary model "
+            "directly off CVAT-labeled data). Currently only 'binary' is supported; requires "
+            "--mask-format cvat_6 in --mode train."
         ),
     )
     parser.add_argument(
@@ -171,13 +178,20 @@ def parse_args() -> argparse.Namespace:
     # also agree there would reject valid eval/test invocations for no reason.
     is_multiclass_model = args.model in MULTI_CLASS_MODELS
     if args.mode == "train":
-        if is_multiclass_model and args.mask_format != "cvat_6":
-            parser.error(f"--model {args.model} requires --mask-format cvat_6")
-        if args.mask_format == "cvat_6" and not is_multiclass_model:
+        # --convert-mask-format overrides what the model actually trains on: with --mask-format
+        # cvat_6 --convert-mask-format binary, ground truth is still parsed from CVAT XML (below,
+        # needs_cvat_path), but collapsed to binary before it reaches the model, so --model must
+        # agree with this *effective* format, not the raw --mask-format.
+        effective_format = args.convert_mask_format if args.convert_mask_format is not None else args.mask_format
+        if is_multiclass_model and effective_format != "cvat_6":
+            parser.error(f"--model {args.model} requires --mask-format cvat_6 (with no --convert-mask-format)")
+        if effective_format == "cvat_6" and not is_multiclass_model:
             parser.error(
-                f"--mask-format cvat_6 requires a multi-class --model (one of {sorted(MULTI_CLASS_MODELS)}), "
-                f"got '{args.model}'"
+                f"--mask-format cvat_6 (with no --convert-mask-format) requires a multi-class --model "
+                f"(one of {sorted(MULTI_CLASS_MODELS)}), got '{args.model}'"
             )
+        if args.convert_mask_format is not None and args.mask_format != "cvat_6":
+            parser.error("--convert-mask-format is only used with --mask-format cvat_6")
 
     # --freeze-encoder only means anything for a model with a pretrained encoder to freeze;
     # None (neither --freeze-encoder nor --no-freeze-encoder given) resolves to "on" for those
@@ -195,13 +209,16 @@ def parse_args() -> argparse.Namespace:
             "otherwise early stopping would end training before the encoder ever gets a chance to unfreeze"
         )
 
-    # --test-mask-format / --convert-mask-format only mean anything for --mode test, where
-    # ground-truth masks (--test-mask-format) get compared against a model's prediction
-    # (native --mask-format), optionally through a common --convert-mask-format.
+    # --test-mask-format only means anything for --mode test, where ground-truth masks
+    # (--test-mask-format) get compared against a model's prediction (native --mask-format),
+    # optionally through a common --convert-mask-format. --convert-mask-format also means
+    # something for --mode train (see the effective_format check above): it collapses the
+    # cvat_6 ground truth to binary before training, letting a binary model train directly off
+    # CVAT-labeled data.
     if args.test_mask_format is not None and args.mode != "test":
         parser.error("--test-mask-format is only used with --mode test")
-    if args.convert_mask_format is not None and args.mode != "test":
-        parser.error("--convert-mask-format is only used with --mode test")
+    if args.convert_mask_format is not None and args.mode not in ("train", "test"):
+        parser.error("--convert-mask-format is only used with --mode train/test")
     if args.test_mask_format is None:
         args.test_mask_format = "binary"
     if args.mode == "test" and args.test_mask_format != args.mask_format and args.convert_mask_format is None:
@@ -329,18 +346,18 @@ def run_eval(
     # A multi-class model's raw output is (B, num_classes, H, W) softmax
     # probabilities. --mode eval's output format stays the same alpha-matte
     # pipeline as the binary models: collapse each pixel to its argmax
-    # class, then to a binary foreground/background decision. Unlike --mode
-    # test's --convert-mask-format (which uses mask_formats.Cvat6Format's
-    # fixed background-only-is-background split), this eval-only collapse
-    # instead treats CvatLabelMap.EVAL_FOREGROUND classes as foreground and
-    # everything else (background, and any other class) as background --
-    # see CvatLabelMap.eval_foreground_indices(). Note this makes the
+    # class, then to a binary foreground/background decision, treating
+    # CvatLabelMap.FOREGROUND_CLASSES classes as foreground and everything
+    # else (background, and any other class) as background -- see
+    # CvatLabelMap.foreground_indices(), the same definition shared by
+    # --mode test's --convert-mask-format and train/test's fg metrics
+    # (mask_formats.Cvat6Format.background_classes()). Note this makes the
     # collapse a discrete decision at the model's native resolution (not a
     # continuous probability), so the alpha edges below lose some of the
     # smoothing the linear upscale used to give a continuous foreground
     # probability. --mode eval_mul instead keeps every class distinct (see
     # its branch below), so this collapse only applies to --mode eval.
-    eval_foreground_indices = list(CvatLabelMap().eval_foreground_indices()) if is_multiclass_model else None
+    foreground_class_indices = list(CvatLabelMap().foreground_indices()) if is_multiclass_model else None
 
     # --mode eval_mul: colored overlay of every predicted class, generic
     # across whatever --mask-format says the checkpoint's raw channels mean
@@ -429,8 +446,8 @@ def run_eval(
                     )
             if mode == "eval" and is_multiclass_model and preds is not None:
                 class_idx = get_mask_format("cvat_6").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
-                # (B, H, W) -> (B, 1, H, W) in {0., 1.}: EVAL_FOREGROUND classes -> 1, else -> 0.
-                preds = np.isin(class_idx, eval_foreground_indices)[:, np.newaxis, :, :].astype(np.float32)
+                # (B, H, W) -> (B, 1, H, W) in {0., 1.}: FOREGROUND_CLASSES classes -> 1, else -> 0.
+                preds = np.isin(class_idx, foreground_class_indices)[:, np.newaxis, :, :].astype(np.float32)
             # mode == "eval_mul": preds stays the raw (B, C, h, w) probabilities untouched here --
             # each item below resizes its own C channels to full resolution before collapsing, so
             # the collapse happens at the frame's native resolution instead of the model's small
@@ -590,6 +607,8 @@ def main() -> None:
                 copy_paste_count=args.copy_paste_count,
                 copy_paste_seed=args.copy_paste_seed,
                 freeze_encoder=args.freeze_encoder,
+                mask_format=args.mask_format,
+                mask_paths=args.mask_path,
                 unfreeze_patience=args.unfreeze_patience,
                 encoder_lr_factor=args.encoder_lr_factor,
             )

@@ -43,6 +43,23 @@ class CvatLabelMap:
     labels (that aren't meant to be their own class) into background; any
     other unrecognized label raises immediately -- a real typo/unexpected
     label in the data should fail loudly, not silently corrupt training data.
+
+    Two independent notions of "background" live here, deliberately kept
+    apart:
+
+    - ``BACKGROUND``/``background_index``: the literal CVAT "background"
+      class (always index 0). This is a data-format fact -- render_mask's
+      canvas fill value for pixels no shape covers -- not a judgment call,
+      so it never changes regardless of ``FOREGROUND_CLASSES`` below.
+    - ``FOREGROUND_CLASSES``/``foreground_indices()``/``background_indices()``:
+      which classes count as "foreground" for collapsing a 6-class mask down
+      to a binary foreground/background view. This is the single source of
+      truth shared by --mode eval's alpha-matte collapse, train/test's fg
+      metrics, and --convert-mask-format binary -- see each call site.
+      ``background_indices()`` is its complement, and may be more than one
+      class (e.g. if ``FOREGROUND_CLASSES`` is later narrowed to exclude a
+      real, distinct class -- that class simply isn't "foreground" for this
+      collapse, without becoming the literal background class above).
     """
 
     BACKGROUND = "background"
@@ -52,12 +69,10 @@ class CvatLabelMap:
     # into background rather than error or become a class of their own.
     ALIASES = {"rotate_plate_shader": "background"}
 
-    # Foreground classes for --mode eval's alpha-matte collapse only (see
-    # main.py's run_eval). Independent of BACKGROUND/background_index below,
-    # which stays a single class (render_mask's canvas fill value) and also
-    # backs train/test's fg metrics via mask_formats.Cvat6Format -- changing
-    # this list doesn't touch either of those.
-    EVAL_FOREGROUND = ["pottery", "teapot", "rotate_plate", "rotate_medal", "clay_and_rotator"]
+    # Foreground classes for the fg/bg collapse shared by --mode eval's
+    # alpha-matte output, train/test's fg metrics, and --convert-mask-format
+    # binary (see class docstring above for how this relates to BACKGROUND).
+    FOREGROUND_CLASSES = ["pottery", "teapot"]
 
     def __init__(self) -> None:
         self._name_to_index = {name: i for i, name in enumerate(self.CLASSES)}
@@ -70,9 +85,13 @@ class CvatLabelMap:
     def background_index(self) -> int:
         return self._name_to_index[self.BACKGROUND]
 
-    def eval_foreground_indices(self) -> set[int]:
-        """Class indices EVAL_FOREGROUND names -- see its docstring above."""
-        return {self.index_for(name) for name in self.EVAL_FOREGROUND}
+    def foreground_indices(self) -> set[int]:
+        """Class indices FOREGROUND_CLASSES names -- see class docstring above."""
+        return {self.index_for(name) for name in self.FOREGROUND_CLASSES}
+
+    def background_indices(self) -> set[int]:
+        """Complement of foreground_indices() -- see class docstring above."""
+        return set(range(self.num_classes)) - self.foreground_indices()
 
     def index_for(self, label: str) -> int:
         if label in self._name_to_index:

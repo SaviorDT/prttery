@@ -66,7 +66,7 @@ class Cvat6Format(MaskFormat):
         self._label_map = CvatLabelMap()
 
     def background_classes(self) -> set[int]:
-        return {self._label_map.background_index}
+        return self._label_map.background_indices()
 
     def raw_output_to_class_index(self, raw: np.ndarray) -> np.ndarray:
         # (N, 6, H, W) per-pixel softmax -> (N, H, W) argmax class index.
