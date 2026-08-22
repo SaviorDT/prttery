@@ -33,6 +33,14 @@ class MaskFormat:
         class-index shape as ``raw_output_to_class_index``."""
         raise NotImplementedError
 
+    def class_names(self) -> list[str] | None:
+        """Display name for each class index (``names[i]`` labels class ``i``),
+        or ``None`` if this format has no names to offer. Optional -- only
+        consumed by --mode eval_mul's legend (see outputer.overlay), which
+        degrades gracefully (no legend, one warning) when this is ``None``
+        rather than requiring every format to invent names."""
+        return None
+
 
 class BinaryFormat(MaskFormat):
     name = "binary"
@@ -67,6 +75,9 @@ class Cvat6Format(MaskFormat):
     def ground_truth_to_class_index(self, target: np.ndarray) -> np.ndarray:
         # already (N, H, W) class-index.
         return target.astype(np.int64)
+
+    def class_names(self) -> list[str] | None:
+        return self._label_map.CLASSES
 
 
 MASK_FORMATS: dict[str, MaskFormat] = {

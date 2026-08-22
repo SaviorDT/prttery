@@ -1,7 +1,8 @@
 """CLI entry point.
 
-    uv run main.py --mode train --dirs foo bar
-    uv run main.py --mode eval  --dirs foo bar
+    uv run main.py --mode train     --dirs foo bar
+    uv run main.py --mode eval      --dirs foo bar
+    uv run main.py --mode eval_mul  --dirs foo bar
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from data_loader.normal import EvalDataset, EvalItem, eval_collate, get_eval_ite
 from mask_formats import get_mask_format
 from models import get_model_class
 from outputer.mp4 import close_nvenc_writer, open_nvenc_writer, probe_nvenc_available, write_nvenc_frame, write_video
+from outputer.overlay import ClassOverlayRenderer
 
 # Cap on how many full-resolution original frames the background reader
 # thread may hold in memory at once (backpressure via a bounded queue),
@@ -42,7 +44,7 @@ MULTI_CLASS_MODELS = {"unet_resnet18_mul"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="UNet background removal")
-    parser.add_argument("--mode", choices=["train", "eval", "test"], required=True)
+    parser.add_argument("--mode", choices=["train", "eval", "eval_mul", "test"], required=True)
     parser.add_argument("--model", choices=["unet", "unet_resnet18", "unet_resnet18_mul"], default="unet_resnet18_mul")
     parser.add_argument("--dirs", nargs="+", required=True, help="Folder names under ./data")
     parser.add_argument("--epochs", type=int, default=100)
@@ -295,32 +297,65 @@ def _webp_writer(q: "queue.Queue[tuple[str, np.ndarray] | None]") -> None:
 
 
 def run_eval(
-    dirs: list[str], model_name: str, model_path: str, output_dir: str, mask_format: str, batch_size: int = 8
+    dirs: list[str],
+    model_name: str,
+    model_path: str,
+    output_dir: str,
+    mask_format: str,
+    batch_size: int = 8,
+    mode: str = "eval",
 ) -> None:
+    """Shared pipeline for ``--mode eval`` and ``--mode eval_mul`` -- same
+    background reader thread, DataLoader loop, webp writer pool, and
+    NVENC/video assembly either way. ``mode`` only switches the per-frame
+    compositing step (see the two branches inside the loop below):
+
+    - ``"eval"``: today's alpha-matte behavior, producing a transparent
+      foreground/background matte (see the collapse comment below).
+    - ``"eval_mul"``: a colored overlay of each pixel's predicted class (via
+      ``outputer.overlay.ClassOverlayRenderer``), always fully opaque.
+    """
     model = get_model_class(model_name)()
     model.load(model_path)
 
     in_height, in_width = model.input_shape[0], model.input_shape[1]
 
+    # --mask-format (validated against --model in parse_args), not --model, is the source of
+    # truth for how to interpret a checkpoint's raw output, matching how it's already the
+    # source of truth for --mode train/test.
+    format_obj = get_mask_format(mask_format)
+    is_multiclass_model = mask_format == "cvat_6"
+
     # A multi-class model's raw output is (B, num_classes, H, W) softmax
-    # probabilities. Output format here stays the same alpha-matte pipeline
-    # as the binary models: collapse each pixel to its argmax class, then to
-    # a binary foreground/background decision. Unlike --mode test's
-    # --convert-mask-format (which uses mask_formats.Cvat6Format's fixed
-    # background-only-is-background split), this eval-only collapse instead
-    # treats CvatLabelMap.EVAL_FOREGROUND classes as foreground and
+    # probabilities. --mode eval's output format stays the same alpha-matte
+    # pipeline as the binary models: collapse each pixel to its argmax
+    # class, then to a binary foreground/background decision. Unlike --mode
+    # test's --convert-mask-format (which uses mask_formats.Cvat6Format's
+    # fixed background-only-is-background split), this eval-only collapse
+    # instead treats CvatLabelMap.EVAL_FOREGROUND classes as foreground and
     # everything else (background, and any other class) as background --
     # see CvatLabelMap.eval_foreground_indices(). Note this makes the
     # collapse a discrete decision at the model's native resolution (not a
     # continuous probability), so the alpha edges below lose some of the
     # smoothing the linear upscale used to give a continuous foreground
-    # probability.
-    #
-    # --mask-format (validated against --model in parse_args), not --model, is the source of
-    # truth here: it's what determines the collapse below, matching how it's already the
-    # source of truth for --mode train/test.
-    is_multiclass_model = mask_format == "cvat_6"
+    # probability. --mode eval_mul instead keeps every class distinct (see
+    # its branch below), so this collapse only applies to --mode eval.
     eval_foreground_indices = list(CvatLabelMap().eval_foreground_indices()) if is_multiclass_model else None
+
+    # --mode eval_mul: colored overlay of every predicted class, generic
+    # across whatever --mask-format says the checkpoint's raw channels mean
+    # (background_classes()/class_names() are both per-format, everything
+    # else in ClassOverlayRenderer is format-agnostic). If the format has no
+    # names to offer (e.g. 'binary'), warn once up front and run without a
+    # legend for the whole run, rather than failing -- coloring itself never
+    # depends on having names.
+    overlay_renderer = None
+    class_names = None
+    if mode == "eval_mul":
+        overlay_renderer = ClassOverlayRenderer()
+        class_names = format_obj.class_names()
+        if class_names is None:
+            print(f"Warning: --mask-format '{mask_format}' provides no class names; eval_mul will run without a legend")
 
     items_by_dir = get_eval_items(dirs)
 
@@ -392,10 +427,14 @@ def run_eval(
                         f"--mask-format binary but '{model_path}' outputs {num_channels} channels "
                         f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
                     )
-            if is_multiclass_model and preds is not None:
+            if mode == "eval" and is_multiclass_model and preds is not None:
                 class_idx = get_mask_format("cvat_6").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
                 # (B, H, W) -> (B, 1, H, W) in {0., 1.}: EVAL_FOREGROUND classes -> 1, else -> 0.
                 preds = np.isin(class_idx, eval_foreground_indices)[:, np.newaxis, :, :].astype(np.float32)
+            # mode == "eval_mul": preds stays the raw (B, C, h, w) probabilities untouched here --
+            # each item below resizes its own C channels to full resolution before collapsing, so
+            # the collapse happens at the frame's native resolution instead of the model's small
+            # input resolution (see the per-item branch).
 
             valid_idx = 0
             for item, is_valid in zip(batch_items, valid_mask):
@@ -417,16 +456,36 @@ def run_eval(
                     if nvenc_ok:
                         nvenc_proc = open_nvenc_writer(video_path, fps, frame_size)
 
-                # Upscale the continuous probability map (not an already-binarized
-                # mask) with linear interpolation for a smooth edge contour, then
-                # threshold so alpha values stay strictly 0/255.
-                prob = cv2.resize(
-                    pred[0].astype(np.float32), (orig_width, orig_height), interpolation=cv2.INTER_LINEAR
-                )
-                mask = np.where(prob > 0.5, np.uint8(255), np.uint8(0))
+                if mode == "eval_mul":
+                    # Resize every raw probability channel to full resolution first (linear
+                    # interpolation, same sub-pixel-accurate boundary placement as --mode eval's
+                    # single-channel resize below), *then* collapse to a class index -- so the
+                    # class boundary is decided at the frame's native resolution, not the
+                    # model's small input resolution. Works unmodified for any channel count:
+                    # 1 (binary) or 6 (cvat_6) today, whatever a future format uses tomorrow.
+                    raw = pred.astype(np.float32).transpose(1, 2, 0)  # (h, w, C)
+                    raw_resized = cv2.resize(raw, (orig_width, orig_height), interpolation=cv2.INTER_LINEAR)
+                    if raw_resized.ndim == 2:  # cv2.resize squeezes a single-channel (C=1) result
+                        raw_resized = raw_resized[:, :, np.newaxis]
+                    raw_resized = raw_resized.transpose(2, 0, 1)[np.newaxis, ...]  # (1, C, H, W)
+                    class_idx = format_obj.raw_output_to_class_index(raw_resized)[0]  # (H, W)
 
-                bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)  # original resolution, not resized
-                bgra[:, :, 3] = mask
+                    composited = overlay_renderer.render(
+                        image, class_idx, format_obj.background_classes(), class_names
+                    )
+                    bgra = cv2.cvtColor(composited, cv2.COLOR_BGR2BGRA)
+                    bgra[:, :, 3] = 255  # always opaque -- outputer.mp4's black-composite is then a no-op
+                else:
+                    # Upscale the continuous probability map (not an already-binarized
+                    # mask) with linear interpolation for a smooth edge contour, then
+                    # threshold so alpha values stay strictly 0/255.
+                    prob = cv2.resize(
+                        pred[0].astype(np.float32), (orig_width, orig_height), interpolation=cv2.INTER_LINEAR
+                    )
+                    mask = np.where(prob > 0.5, np.uint8(255), np.uint8(0))
+
+                    bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)  # original resolution, not resized
+                    bgra[:, :, 3] = mask
 
                 # Lossy WebP (with alpha preserved): far smaller than lossless PNG
                 # (roughly an order of magnitude on photographic content) while
@@ -563,6 +622,8 @@ def main() -> None:
                 convert_mask_format=args.convert_mask_format,
             )
     else:
+        # args.mode is "eval" or "eval_mul" here (train/test handled above) --
+        # both share run_eval's pipeline, mode only switches the compositing step.
         run_eval(
             dirs=args.dirs,
             model_name=args.model,
@@ -570,6 +631,7 @@ def main() -> None:
             output_dir=args.output_dir,
             mask_format=args.mask_format,
             batch_size=args.batch_size,
+            mode=args.mode,
         )
 
     elapsed = time.monotonic() - start_time
