@@ -8,6 +8,8 @@ from __future__ import annotations
 import copy
 import os
 
+import cv2
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -15,7 +17,7 @@ from tqdm import tqdm
 
 from data_loader.normal import get_test_dataset, get_train_val_datasets
 from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
-from models import get_model_class
+from models.base import ModelBase
 from train import freezing
 
 
@@ -55,6 +57,57 @@ def _bce_loss(pred_prob: np.ndarray, target: np.ndarray) -> float:
     return float(-np.mean(target * np.log(p) + (1 - target) * np.log(1 - p)))
 
 
+def _boundary_f1(pred_prob: np.ndarray, target: np.ndarray, tolerance_px: int) -> float:
+    """Boundary F1 for binary batches, using a pixel-distance tolerance."""
+    total_precision_hits = total_pred = total_recall_hits = total_true = 0
+    for pred_item, target_item in zip(pred_prob[:, 0], target[:, 0]):
+        pred = (pred_item > 0.5).astype(np.uint8)
+        truth = (target_item > 0.5).astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
+        pred_edge = cv2.morphologyEx(pred, cv2.MORPH_GRADIENT, kernel)
+        truth_edge = cv2.morphologyEx(truth, cv2.MORPH_GRADIENT, kernel)
+        pred_count, truth_count = int(pred_edge.sum()), int(truth_edge.sum())
+        if pred_count == truth_count == 0:
+            total_precision_hits += 1; total_pred += 1; total_recall_hits += 1; total_true += 1
+            continue
+        if pred_count:
+            distance_to_truth = cv2.distanceTransform((truth_edge == 0).astype(np.uint8), cv2.DIST_L2, 3)
+            total_precision_hits += int((distance_to_truth[pred_edge.astype(bool)] <= tolerance_px).sum())
+            total_pred += pred_count
+        if truth_count:
+            distance_to_pred = cv2.distanceTransform((pred_edge == 0).astype(np.uint8), cv2.DIST_L2, 3)
+            total_recall_hits += int((distance_to_pred[truth_edge.astype(bool)] <= tolerance_px).sum())
+            total_true += truth_count
+    precision = total_precision_hits / max(total_pred, 1)
+    recall = total_recall_hits / max(total_true, 1)
+    return 2 * precision * recall / max(precision + recall, 1e-7)
+
+
+def _native_boundary_f1(predictions: np.ndarray, dataset, tolerance_px: int) -> float:
+    """Restore each validation prediction to its annotation's native size."""
+    scores = []
+    if hasattr(dataset, "pairs"):
+        records = dataset.pairs
+        for prediction, (_image_path, mask_path) in zip(predictions, records):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise FileNotFoundError(f"Failed to read mask: {mask_path}")
+            target = (mask > 127).astype(np.float32)
+            probability = cv2.resize(prediction[0], (target.shape[1], target.shape[0]), interpolation=cv2.INTER_LINEAR)
+            scores.append(_boundary_f1(probability[None, None], target[None, None], tolerance_px))
+    elif hasattr(dataset, "cvat_dataset"):
+        from data_loader.cvat import render_mask
+        cvat_dataset = dataset.cvat_dataset
+        for prediction, (_image_path, shapes, width, height) in zip(predictions, cvat_dataset.triples):
+            classes = render_mask(shapes, height, width, cvat_dataset.label_map)
+            target = to_binary(classes[None], "cvat_6")[0]
+            probability = cv2.resize(prediction[0], (width, height), interpolation=cv2.INTER_LINEAR)
+            scores.append(_boundary_f1(probability[None, None], target[None, None], tolerance_px))
+    else:
+        raise TypeError(f"Unsupported validation dataset for native Boundary F1: {type(dataset).__name__}")
+    return float(np.mean(scores))
+
+
 def _average_metrics(metric_dicts: list[dict]) -> dict:
     keys = metric_dicts[0].keys()
     return {k: float(np.mean([m[k] for m in metric_dicts])) for k in keys}
@@ -67,7 +120,7 @@ def _format_metrics(prefix: str, loss: float | None, metrics: dict) -> str:
 
 def run(
     dirs: list[str],
-    model_name: str = "unet",
+    model_class: type[ModelBase],
     epochs: int = 50,
     batch_size: int = 8,
     lr: float = 1e-3,
@@ -86,6 +139,10 @@ def run(
     encoder_lr_factor: float = 0.1,
     mask_format: str = "binary",
     mask_paths: list[str] | None = None,
+    image_size: tuple[int, int] = (180, 320),
+    loss_name: str = "BCE",
+    early_stop_check: str | None = None,
+    boundary_tolerance_px: int = 2,
 ) -> None:
     if mask_format == "cvat_6":
         # Ground truth is CVAT-labeled (6-class), but --convert-mask-format binary (enforced by
@@ -94,12 +151,12 @@ def run(
         from data_loader.cvat import get_train_val_datasets as get_cvat_train_val_datasets
 
         cvat_train_dataset, cvat_val_dataset = get_cvat_train_val_datasets(
-            dirs, mask_paths, val_ratio=val_ratio, seed=split_seed
+            dirs, mask_paths, val_ratio=val_ratio, seed=split_seed, image_size=image_size
         )
         train_dataset = _BinaryFromCvatDataset(cvat_train_dataset)
         val_dataset = _BinaryFromCvatDataset(cvat_val_dataset) if cvat_val_dataset is not None else None
     else:
-        train_dataset, val_dataset = get_train_val_datasets(dirs, val_ratio=val_ratio, seed=split_seed)
+        train_dataset, val_dataset = get_train_val_datasets(dirs, val_ratio=val_ratio, seed=split_seed, image_size=image_size)
     has_val = val_dataset is not None
     original_train_count = len(train_dataset)
 
@@ -151,15 +208,15 @@ def run(
         else None
     )
 
-    model = get_model_class(model_name)()
-    model.create(lr=lr)
+    model = model_class(*image_size)
+    model.create(lr=lr, loss_name=loss_name)
 
     if freeze_encoder:
         freezing.freeze_encoder(model)
-        tqdm.write(f"Encoder frozen; will unfreeze after {unfreeze_patience} epoch(s) without val-loss improvement.")
+        tqdm.write(f"Encoder frozen; will unfreeze after {unfreeze_patience} epoch(s) without validation-monitor improvement.")
     encoder_frozen = freeze_encoder
 
-    best_val_loss = float("inf")
+    best_monitor_value = float("inf") if early_stop_check is None else float("-inf")
     best_state = None
     no_improve_count = 0
     lr_no_improve_count = 0
@@ -187,24 +244,30 @@ def run(
         # ---- validation ----
         val_losses = []
         val_metrics = []
+        boundary_scores = []
+        val_predictions = []
         for x, y in tqdm(val_loader, desc=f"Val {epoch}", leave=False):
-            pred = model.eval(x)
+            batch_loss, pred = model.evaluate(x, y)
             y_np = y.numpy()
-            val_losses.append(_bce_loss(pred, y_np))
+            val_losses.append(batch_loss)
             val_metrics.append(compute_metrics(pred, y_np))
+            val_predictions.append(pred)
 
         val_loss = float(np.mean(val_losses))
         val_metric_avg = _average_metrics(val_metrics)
-        tqdm.write(f"Epoch {epoch}/{epochs} " + _format_metrics("val", val_loss, val_metric_avg))
+        boundary_f1 = _native_boundary_f1(np.concatenate(val_predictions), val_dataset, boundary_tolerance_px)
+        tqdm.write(f"Epoch {epoch}/{epochs} " + _format_metrics("val", val_loss, val_metric_avg) + f" boundary_f1={boundary_f1:.4f}")
+        monitor_value = val_loss if early_stop_check is None else (val_metric_avg["f1"] if early_stop_check == "dice" else boundary_f1)
+        improved = monitor_value < best_monitor_value if early_stop_check is None else monitor_value > best_monitor_value
 
-        # ---- early stopping / lr decay ----
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # ---- checkpoint / early stopping / lr decay ----
+        if improved:
+            best_monitor_value = monitor_value
             best_state = copy.deepcopy(model.net.state_dict())
             no_improve_count = 0
             lr_no_improve_count = 0
             unfreeze_no_improve_count = 0
-            tqdm.write(f"Epoch {epoch}: val loss improved to {val_loss:.4f}, saving best weights")
+            tqdm.write(f"Epoch {epoch}: validation {early_stop_check or 'loss'} improved to {monitor_value:.4f}, saving best weights")
         else:
             no_improve_count += 1
             lr_no_improve_count += 1
@@ -255,9 +318,9 @@ def run(
     final_losses = []
     final_metrics = []
     for x, y in final_loader:
-        pred = model.eval(x)
+        batch_loss, pred = model.evaluate(x, y)
         y_np = y.numpy()
-        final_losses.append(_bce_loss(pred, y_np))
+        final_losses.append(batch_loss)
         final_metrics.append(compute_metrics(pred, y_np))
 
     final_loss = float(np.mean(final_losses))
@@ -276,11 +339,12 @@ def run(
 def run_test(
     dirs: list[str],
     model_path: str,
-    model_name: str = "unet",
+    model_class: type[ModelBase],
     batch_size: int = 8,
     mask_paths: list[str] | None = None,
     test_mask_format: str = "binary",
     convert_mask_format: str | None = None,
+    image_size: tuple[int, int] = (180, 320),
 ) -> None:
     """Evaluate a saved model (native format: binary) against all labeled data
     (train and val combined).
@@ -298,11 +362,11 @@ def run_test(
     native_format = "binary"
 
     if test_mask_format == native_format:
-        test_dataset = get_test_dataset(dirs)
+        test_dataset = get_test_dataset(dirs, image_size=image_size)
     else:
         from data_loader.cvat import get_test_dataset as get_cvat_test_dataset
 
-        test_dataset = get_cvat_test_dataset(dirs, mask_paths)
+        test_dataset = get_cvat_test_dataset(dirs, mask_paths, image_size=image_size)
     print(f"Test samples: {len(test_dataset)}")
 
     num_workers = min(4, os.cpu_count() or 1)
@@ -315,7 +379,7 @@ def run_test(
         persistent_workers=num_workers > 0,
     )
 
-    model = get_model_class(model_name)()
+    model = model_class()
     model.load(model_path)
 
     same_format = test_mask_format == native_format

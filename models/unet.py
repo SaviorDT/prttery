@@ -1,7 +1,7 @@
 """A basic UNet model for background removal (binary segmentation).
 
 Input:  320 (W) x 180 (H) x 3 (RGB), normalized to [0, 1]
-Output: 320 (W) x 180 (H) binary mask (probability of "foreground")
+Output: 320 (W) x 180 (H) binary logits during training (probability in exported ONNX)
 """
 
 from __future__ import annotations
@@ -57,7 +57,6 @@ class _UNetNetwork(nn.Module):
         self.dec1 = _ConvBlock(64 + 32, 32)
 
         self.out_conv = nn.Conv2d(32, out_channels, kernel_size=1)
-        self.out_act = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(x)
@@ -76,7 +75,7 @@ class _UNetNetwork(nn.Module):
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
         out = self.out_conv(d1)
-        return self.out_act(out)
+        return out
 
 
 class UNet(ModelBase):
@@ -84,6 +83,7 @@ class UNet(ModelBase):
 
     input_shape = (180, 320, 3)  # (H, W, C)
     output_shape = (180, 320)  # (H, W)
+    OUTPUT_IS_LOGITS = True
 
     def _build_network(self) -> nn.Module:
         return _UNetNetwork(in_channels=self.input_shape[2], out_channels=1)

@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 from data_loader.cvat import CvatLabelMap, get_test_dataset, get_train_val_datasets
 from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
-from models import get_model_class
+from models.base import ModelBase
 from train import freezing
 
 
@@ -96,7 +96,7 @@ def _format_metrics(prefix: str, loss: float | None, metrics: dict) -> str:
 def run(
     dirs: list[str],
     mask_paths: list[str],
-    model_name: str = "unet_resnet18_mul",
+    model_class: type[ModelBase],
     epochs: int = 50,
     batch_size: int = 8,
     lr: float = 1e-3,
@@ -113,10 +113,11 @@ def run(
     freeze_encoder: bool = False,
     unfreeze_patience: int = 4,
     encoder_lr_factor: float = 0.1,
+    image_size: tuple[int, int] = (180, 320),
 ) -> None:
     label_map = CvatLabelMap()
 
-    train_dataset, val_dataset = get_train_val_datasets(dirs, mask_paths, val_ratio=val_ratio, seed=split_seed)
+    train_dataset, val_dataset = get_train_val_datasets(dirs, mask_paths, val_ratio=val_ratio, seed=split_seed, image_size=image_size)
     has_val = val_dataset is not None
     original_train_count = len(train_dataset)
 
@@ -168,7 +169,7 @@ def run(
         else None
     )
 
-    model = get_model_class(model_name)()
+    model = model_class(*image_size)
     model.create(lr=lr)
 
     if freeze_encoder:
@@ -301,10 +302,11 @@ def run_test(
     dirs: list[str],
     mask_paths: list[str] | None,
     model_path: str,
-    model_name: str = "unet_resnet18_mul",
+    model_class: type[ModelBase],
     batch_size: int = 8,
     test_mask_format: str = "cvat_6",
     convert_mask_format: str | None = None,
+    image_size: tuple[int, int] = (180, 320),
 ) -> None:
     """Evaluate a saved model (native format: cvat_6) against all labeled data
     (train and val combined).
@@ -323,11 +325,11 @@ def run_test(
     native_format = "cvat_6"
 
     if test_mask_format == native_format:
-        test_dataset = get_test_dataset(dirs, mask_paths)
+        test_dataset = get_test_dataset(dirs, mask_paths, image_size=image_size)
     else:
         from data_loader.normal import get_test_dataset as get_binary_test_dataset
 
-        test_dataset = get_binary_test_dataset(dirs)
+        test_dataset = get_binary_test_dataset(dirs, image_size=image_size)
     print(f"Test samples: {len(test_dataset)}")
 
     num_workers = min(4, os.cpu_count() or 1)
@@ -340,7 +342,7 @@ def run_test(
         persistent_workers=num_workers > 0,
     )
 
-    model = get_model_class(model_name)()
+    model = model_class()
     model.load(model_path)
 
     same_format = test_mask_format == native_format

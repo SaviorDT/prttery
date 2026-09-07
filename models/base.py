@@ -19,6 +19,34 @@ import torch
 from torch import nn
 
 
+class _ProbabilityExport(nn.Module):
+    """Expose a binary logits network as a probability-producing ONNX graph."""
+
+    def __init__(self, network: nn.Module) -> None:
+        super().__init__()
+        self.network = network
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.network(x))
+
+
+class _BceDiceLoss(nn.Module):
+    """Equal-weight BCE-with-logits and soft Dice loss for binary masks."""
+
+    def __init__(self, eps: float = 1e-7) -> None:
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = self.bce(logits, target)
+        prob = torch.sigmoid(logits)
+        intersection = (prob * target).sum(dim=(1, 2, 3))
+        denominator = prob.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+        dice_loss = 1 - ((2 * intersection + self.eps) / (denominator + self.eps)).mean()
+        return 0.5 * bce + 0.5 * dice_loss
+
+
 class ModelBase(ABC):
     """Common interface shared by every model.
 
@@ -38,8 +66,17 @@ class ModelBase(ABC):
     # validation in main.py. 'unet' has no pretrained encoder, so this stays
     # False there and encoder_modules() below is never called for it.
     HAS_PRETRAINED_ENCODER: bool = False
+    OUTPUT_IS_LOGITS: bool = False
 
-    def __init__(self) -> None:
+    def __init__(self, height: int = 180, width: int = 320) -> None:
+        if height <= 0 or width <= 0:
+            raise ValueError(f"height and width must be positive, got {(height, width)}")
+        channels = self.input_shape[2]
+        self.input_shape = (height, width, channels)
+        if len(self.output_shape) == 2:
+            self.output_shape = (height, width)
+        else:
+            self.output_shape = (self.output_shape[0], height, width)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type == "cuda":
             print(f"Using GPU: {torch.cuda.get_device_name(self.device)}")
@@ -84,11 +121,18 @@ class ModelBase(ABC):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-    def create(self, lr: float = 1e-3) -> None:
+    def create(self, lr: float = 1e-3, loss_name: str = "BCE") -> None:
         """Initialize a fresh network, optimizer and loss function for training."""
         self.net = self._build_network().to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
-        self.criterion = nn.BCELoss()
+        if not self.OUTPUT_IS_LOGITS:
+            raise RuntimeError(f"{type(self).__name__} must provide its own create() for a non-binary loss")
+        if loss_name == "BCE":
+            self.criterion = nn.BCEWithLogitsLoss()
+        elif loss_name == "BCE_Dice":
+            self.criterion = _BceDiceLoss()
+        else:
+            raise ValueError("loss_name must be 'BCE' or 'BCE_Dice' for a binary model")
         self.session = None
 
     def train(self, x: torch.Tensor, y: torch.Tensor) -> tuple[float, np.ndarray]:
@@ -119,12 +163,25 @@ class ModelBase(ABC):
         y = y.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad()
-        pred = self.net(x)
-        loss = self.criterion(pred, y)
+        raw_prediction = self.net(x)
+        loss = self.criterion(raw_prediction, y)
         loss.backward()
         self.optimizer.step()
 
-        return float(loss.item()), pred.detach().cpu().numpy()
+        prediction = torch.sigmoid(raw_prediction) if self.OUTPUT_IS_LOGITS else raw_prediction
+        return float(loss.item()), prediction.detach().cpu().numpy()
+
+    def evaluate(self, x: torch.Tensor, y: torch.Tensor) -> tuple[float, np.ndarray]:
+        """Return validation loss and probability prediction from the live network."""
+        if self.net is None or self.criterion is None:
+            raise RuntimeError("Validation requires a live model created with create().")
+        self.net.eval()
+        with torch.no_grad():
+            raw_prediction = self.net(x.to(self.device, non_blocking=True))
+            target = y.to(self.device, non_blocking=True)
+            loss = self.criterion(raw_prediction, target)
+            prediction = torch.sigmoid(raw_prediction) if self.OUTPUT_IS_LOGITS else raw_prediction
+        return float(loss.item()), prediction.cpu().numpy()
 
     def eval(self, x: torch.Tensor) -> np.ndarray:
         """Run inference and return the predicted probability map.
@@ -139,6 +196,8 @@ class ModelBase(ABC):
             with torch.no_grad():
                 x = x.to(self.device, non_blocking=True)
                 pred = self.net(x)
+                if self.OUTPUT_IS_LOGITS:
+                    pred = torch.sigmoid(pred)
             return pred.detach().cpu().numpy()
 
         if self.session is not None:
@@ -159,9 +218,10 @@ class ModelBase(ABC):
         h, w, c = self.input_shape
         dummy_input = torch.zeros(1, c, h, w, device=self.device)
 
-        self.net.eval()
+        export_net: nn.Module = _ProbabilityExport(self.net) if self.OUTPUT_IS_LOGITS else self.net
+        export_net.eval()
         torch.onnx.export(
-            self.net,
+            export_net,
             dummy_input,
             path,
             input_names=["input"],
@@ -178,5 +238,11 @@ class ModelBase(ABC):
         self.session = onnxruntime.InferenceSession(
             path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
+        input_shape = self.session.get_inputs()[0].shape
+        output_shape = self.session.get_outputs()[0].shape
+        if isinstance(input_shape[2], int) and isinstance(input_shape[3], int):
+            self.input_shape = (input_shape[2], input_shape[3], input_shape[1])
+        if len(output_shape) == 4 and isinstance(output_shape[2], int) and isinstance(output_shape[3], int):
+            self.output_shape = (output_shape[2], output_shape[3]) if output_shape[1] == 1 else (output_shape[1], output_shape[2], output_shape[3])
         self.net = None
         self.optimizer = None

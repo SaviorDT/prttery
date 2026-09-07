@@ -21,22 +21,15 @@ def get_preprocessor_class(name: str) -> type[PreprocessorBase]:
 
 def apply_preprocessors(
     train_dataset: Dataset,
-    names: list[str],
+    preprocessor_classes: tuple[type[PreprocessorBase], ...],
     *,
     copy_paste_count: int | None = None,
     copy_paste_seed: int | None = None,
 ) -> Dataset:
-    """Apply each preprocessor in ``names``, in order, to ``train_dataset``.
-
-    Only ``copy_paste`` exists today, so its own args (``copy_paste_count``/
-    ``copy_paste_seed``) are threaded through explicitly here rather than via
-    a generic per-name config dict; once a second preprocessor needs its own
-    args, this should grow a proper per-name config shape instead.
-    """
+    """Apply configured preprocessor classes in order."""
     dataset = train_dataset
-    for name in names:
-        preprocessor_class = get_preprocessor_class(name)
-        if name == "copy_paste":
+    for preprocessor_class in preprocessor_classes:
+        if preprocessor_class is CopyPastePreprocessor:
             preprocessor = preprocessor_class(count=copy_paste_count, seed=copy_paste_seed)
         else:
             preprocessor = preprocessor_class()

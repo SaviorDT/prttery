@@ -20,11 +20,11 @@ The destination tree is not wiped before running. Existing files at the
 same relative path are overwritten; anything else already in the
 destination is left untouched.
 
-Usage:
-    python3 copy_mask.py [--src /videos] [--dst ./masks] [--dry-run]
+
+Execution settings live in ``param.py``.
+
 """
 
-import argparse
 import os
 import shutil
 import sys
@@ -73,35 +73,20 @@ def find_matches_and_copy(src_root: str, dst_root: str, dry_run: bool) -> list[s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Copy all '*mask*'-named folders (with their subfolders "
-        "and relative parent path) from --src into --dst."
-    )
-    parser.add_argument(
-        "--src", default="/videos", help="source root to search (default: /videos)"
-    )
-    parser.add_argument(
-        "--dst",
-        default="./masks",
-        help="destination root to copy into (default: ./masks)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="list what would be copied without actually copying anything",
-    )
-    args = parser.parse_args()
+    from param import ACTIVE_COPY_MASK
 
-    src_root = os.path.abspath(args.src)
-    dst_root = os.path.abspath(args.dst)
-
-    if not os.path.isdir(src_root):
-        print(f"Error: source directory does not exist: {src_root}", file=sys.stderr)
+    params = ACTIVE_COPY_MASK
+    try:
+        params.validate()
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
         return 1
 
-    copied = find_matches_and_copy(src_root, dst_root, args.dry_run)
+    src_root = os.path.abspath(params.src_root)
+    dst_root = os.path.abspath(params.dst_root)
+    copied = find_matches_and_copy(src_root, dst_root, params.dry_run)
 
-    verb = "would copy" if args.dry_run else "copied"
+    verb = "would copy" if params.dry_run else "copied"
     print(f"\nDone: {verb} {len(copied)} folder(s).")
     return 0
 

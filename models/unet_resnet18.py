@@ -1,7 +1,7 @@
 """UNet with a pretrained ResNet18 encoder for background removal (binary segmentation).
 
 Input:  320 (W) x 180 (H) x 3 (RGB), normalized to [0, 1]
-Output: 320 (W) x 180 (H) binary mask (probability of "foreground")
+Output: 320 (W) x 180 (H) binary logits during training (probability in exported ONNX)
 """
 
 from __future__ import annotations
@@ -74,7 +74,6 @@ class _UNetResNet18Network(nn.Module):
         self.dec1 = _DecoderBlock(64 + 64, 32)
 
         self.out_conv = nn.Conv2d(32, 1, kernel_size=1)
-        self.out_act = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self._mean) / self._std
@@ -101,7 +100,7 @@ class _UNetResNet18Network(nn.Module):
 
         out = self.out_conv(d1)
         out = F.interpolate(out, size=x.shape[2:], mode="bilinear", align_corners=False)
-        return self.out_act(out)
+        return out
 
 
 class UNetResNet18(ModelBase):
@@ -110,6 +109,7 @@ class UNetResNet18(ModelBase):
     input_shape = (180, 320, 3)  # (H, W, C)
     output_shape = (180, 320)  # (H, W)
     HAS_PRETRAINED_ENCODER = True
+    OUTPUT_IS_LOGITS = True
 
     def _build_network(self) -> nn.Module:
         return _UNetResNet18Network(pretrained=True)
