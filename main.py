@@ -1,9 +1,4 @@
-"""CLI entry point.
-
-    uv run main.py --mode train     --dirs foo bar
-    uv run main.py --mode eval      --dirs foo bar
-    uv run main.py --mode eval_mul  --dirs foo bar
-"""
+"""Run the active profile configured in param.py."""
 
 from __future__ import annotations
 
@@ -166,8 +161,8 @@ def run_eval(
             print(f"[{dir_name}] no images found, skipping")
             continue
 
-        # Use only the basename here: dir_name may be an absolute path (e.g.
-        # when the shell expands a "*" glob before Python sees it), and
+        # Use only the basename here: RunParams expansion may produce an
+        # absolute path, and
         # os.path.join() would otherwise discard output_dir entirely.
         out_dir = os.path.join(output_dir, os.path.basename(dir_name))
         os.makedirs(out_dir, exist_ok=True)
@@ -334,7 +329,7 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(f"Configuration error: {error}") from None
 
-    dirs = list(params.dirs)
+    dirs = [str(path) for path in params.dirs]
     mask_paths = [str(path) for path in params.mask_paths]
     model_path = str(params.model_path)
     output_dir = str(params.output_dir)

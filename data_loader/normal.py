@@ -1,21 +1,15 @@
 """Basic data loading utilities for the background-removal task.
 
-Directory convention (relative to ``./data``):
+Each source-frame directory is paired with a sibling whose name ends in
+``_mask``. Run Parameter Paths are already expanded before reaching this
+module and are interpreted relative to the current working directory.
 
-    ./data/{dir_name}/          source frames, named "{second}_{frame}.jpg"
-    ./data/{dir_name}_mask/     ground-truth masks (white=foreground=1,
-                                 black=background=0), same file stem as the
-                                 matching source frame.
-
-Every file present in a ``{dir_name}_mask`` folder is guaranteed (by the task
-spec) to have a same-name counterpart in ``{dir_name}``. Only images that
-have a mask are used as labeled training data; *all* images (labeled or not)
-are candidates for the eval pipeline.
+Only images that have a matching mask are used as labeled training data; all
+images (labeled or not) are candidates for the eval pipeline.
 """
 
 from __future__ import annotations
 
-import glob
 import os
 import random
 import re
@@ -26,7 +20,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-DATA_ROOT = "./data"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 FRAME_NAME_RE = re.compile(r"^(\d+)_(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
 
@@ -50,58 +43,13 @@ def _list_images(dir_path: str) -> dict:
     return result
 
 
-def _resolve_dir_names(dir_names: list[str], data_root: str) -> list[str]:
-    """Expand ``*`` wildcard entries in ``dir_names`` into concrete dir names.
-
-    A wildcard pattern is matched against directories under ``data_root``.
-    A match is only kept if its last path component does *not* end with
-    ``_mask``, and a sibling directory with the same parent path whose last
-    component is ``"{name}_mask"`` also exists. Non-wildcard entries are
-    passed through unchanged (their mask directory is not required to
-    exist).
-    """
-    resolved: list[str] = []
-    seen: set[str] = set()
-
-    for pattern in dir_names:
-        if "*" not in pattern:
-            if pattern not in seen:
-                seen.add(pattern)
-                resolved.append(pattern)
-            continue
-
-        for match in sorted(glob.glob(os.path.join(data_root, pattern))):
-            if not os.path.isdir(match):
-                continue
-
-            rel_dir_name = os.path.relpath(match, data_root)
-            basename = os.path.basename(rel_dir_name)
-            if basename.endswith("_mask"):
-                continue
-
-            mask_dir = os.path.join(os.path.dirname(match), f"{basename}_mask")
-            if not os.path.isdir(mask_dir):
-                continue
-
-            if rel_dir_name not in seen:
-                seen.add(rel_dir_name)
-                resolved.append(rel_dir_name)
-
-    return resolved
-
-
-def scan_dirs(dir_names: list[str], data_root: str = DATA_ROOT):
-    """Scan the given directories under ``data_root``.
-
-    ``dir_names`` entries may contain ``*`` wildcards. A wildcard entry is
-    expanded to every directory under ``data_root`` matching the pattern
-    whose last path component has a sibling ``"{name}_mask"`` directory
-    (same parent path); directories without such a pair are skipped.
+def scan_dirs(dir_names: list[str]):
+    """Scan source-frame directories already expanded by RunParams validation.
 
     Entries that resolve to something other than a genuine source-frame
     directory (a stray file, or a directory whose name itself ends with
     ``"_mask"``) are silently skipped rather than raising, since they can
-    show up when the shell expands a ``*`` glob before Python ever sees it.
+    show up after Run Parameters expand a Dataset Directory Pattern.
 
     Returns
     -------
@@ -113,15 +61,15 @@ def scan_dirs(dir_names: list[str], data_root: str = DATA_ROOT):
     labeled_pairs: list[tuple[str, str]] = []
     all_images: dict[str, list[EvalItem]] = {}
 
-    for dir_name in _resolve_dir_names(dir_names, data_root):
-        image_dir = os.path.join(data_root, dir_name)
-        mask_dir = os.path.join(data_root, f"{dir_name}_mask")
+    for dir_name in dir_names:
+        image_dir = os.path.normpath(dir_name)
+        mask_dir = f"{image_dir}_mask"
 
-        # dir_names may come from a shell-expanded "*" glob, which can include
+        # Expanded Run Parameter Paths can include
         # stray non-directory files (e.g. source .mp4 recordings) and the
         # paired "*_mask" directories themselves; skip anything that isn't a
         # genuine source-frame directory instead of failing the whole scan.
-        if os.path.basename(dir_name).endswith("_mask") or not os.path.isdir(image_dir):
+        if os.path.basename(image_dir).endswith("_mask") or not os.path.isdir(image_dir):
             continue
 
         images = _list_images(image_dir)
@@ -241,7 +189,6 @@ def get_train_val_datasets(
     dir_names: list[str],
     val_ratio: float = 0.2,
     seed: int = 42,
-    data_root: str = DATA_ROOT,
     image_size: tuple[int, int] = (180, 320),
 ):
     """Split labeled (mask-available) samples into train/val datasets.
@@ -250,11 +197,11 @@ def get_train_val_datasets(
     held out for validation: ``val_dataset`` is ``None`` and all labeled
     pairs are used for training.
     """
-    labeled_pairs, _ = scan_dirs(dir_names, data_root=data_root)
+    labeled_pairs, _ = scan_dirs(dir_names)
     if not labeled_pairs:
         raise ValueError(
             "No labeled (image + mask) pairs found. Make sure "
-            "./data/{dir}_mask contains files matching ./data/{dir}."
+            "a sibling {dir}_mask directory contains files matching {dir}."
         )
 
     pairs = list(labeled_pairs)
@@ -273,20 +220,19 @@ def get_train_val_datasets(
 
 def get_test_dataset(
     dir_names: list[str],
-    data_root: str = DATA_ROOT,
     image_size: tuple[int, int] = (180, 320),
 ):
     """Return a dataset of every labeled (image + mask) pair, train and val combined."""
-    labeled_pairs, _ = scan_dirs(dir_names, data_root=data_root)
+    labeled_pairs, _ = scan_dirs(dir_names)
     if not labeled_pairs:
         raise ValueError(
             "No labeled (image + mask) pairs found. Make sure "
-            "./data/{dir}_mask contains files matching ./data/{dir}."
+            "a sibling {dir}_mask directory contains files matching {dir}."
         )
     return SegmentationDataset(labeled_pairs, image_size=image_size)
 
 
-def get_eval_items(dir_names: list[str], data_root: str = DATA_ROOT) -> dict:
+def get_eval_items(dir_names: list[str]) -> dict:
     """Return {dir_name: [EvalItem, ...]} sorted by (second, frame)."""
-    _, all_images = scan_dirs(dir_names, data_root=data_root)
+    _, all_images = scan_dirs(dir_names)
     return all_images

@@ -7,6 +7,7 @@ intentionally not supported.
 
 from __future__ import annotations
 
+import glob
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -47,6 +48,25 @@ def _choices(enum_type: type[Enum]) -> str:
     return ", ".join(repr(item.value) for item in enum_type)
 
 
+def _expand_path_patterns(paths: tuple[Path, ...], field_name: str) -> tuple[Path, ...]:
+    """Expand filesystem patterns relative to the current working directory."""
+    expanded: list[Path] = []
+    seen: set[Path] = set()
+
+    for path in paths:
+        pattern = str(path)
+        has_magic = glob.has_magic(pattern)
+        matches = tuple(Path(match) for match in glob.glob(pattern)) if has_magic else (path,)
+        if has_magic and not matches:
+            raise ValueError(f"{field_name} pattern matched no paths: {path}")
+        for match in matches:
+            if match not in seen:
+                seen.add(match)
+                expanded.append(match)
+
+    return tuple(expanded)
+
+
 @dataclass
 class RunParams:
     """One complete train, test, or eval scenario.
@@ -58,7 +78,7 @@ class RunParams:
 
     mode: RunMode = RunMode.TRAIN
     model_class: type[ModelBase] = UNetResNet18
-    dirs: tuple[str, ...] = ("/videos/0816/*",)
+    dirs: tuple[Path, ...] = (Path("/videos/0816/*"),)
     height: int = 576
     width: int = 1024
     epochs: int = 100
@@ -122,12 +142,14 @@ class RunParams:
             )
         if self.model_class not in MODEL_REGISTRY.values():
             raise ValueError(f"model_class must be one of {list(MODEL_REGISTRY)}, got {self.model_class!r}")
-        if not isinstance(self.dirs, tuple) or not all(isinstance(value, str) and value for value in self.dirs):
-            raise ValueError("dirs must be a tuple of non-empty directory-name strings")
+        if not isinstance(self.dirs, tuple) or not all(isinstance(value, Path) for value in self.dirs):
+            raise ValueError("dirs must be a tuple of pathlib.Path values")
         if not isinstance(self.output_dir, Path) or (self.model_path is not None and not isinstance(self.model_path, Path)):
             raise ValueError("output_dir and model_path must be pathlib.Path values (model_path may be None)")
         if not isinstance(self.mask_paths, tuple) or not all(isinstance(value, Path) for value in self.mask_paths):
             raise ValueError("mask_paths must be a tuple of pathlib.Path values")
+        self.dirs = _expand_path_patterns(self.dirs, "dirs")
+        self.mask_paths = _expand_path_patterns(self.mask_paths, "mask_paths")
         if not isinstance(self.preprocessors, tuple) or any(item not in PREPROCESSOR_REGISTRY.values() for item in self.preprocessors):
             raise ValueError(f"preprocessors must contain classes from {list(PREPROCESSOR_REGISTRY)}")
         for name in ("height", "width", "epochs", "batch_size", "patience", "lr_patience", "unfreeze_patience", "boundary_tolerance_px"):
@@ -163,7 +185,7 @@ class RunParams:
     def validate_rules(self) -> None:
         """Validate relationships between otherwise valid parameter values."""
         if not self.dirs:
-            raise ValueError("dirs is required: set the source directory names in the selected profile in param.py")
+            raise ValueError("dirs is required: set the source directory paths in the selected profile in param.py")
         is_multiclass = self.model_class is UNetResNet18Mul
         if self.mode is RunMode.TRAIN:
             if is_multiclass and self.effective_mask_format is not MaskFormat.CVAT_6:
@@ -240,7 +262,7 @@ class CopyMaskParams:
         self.validate_rules()
 
 
-# Fill ``dirs`` with your dataset directory names before running main.py.
+# Fill ``dirs`` with your dataset directory paths before running main.py.
 CVAT_MULTICLASS = RunParams(model_class=UNetResNet18Mul, mask_format=MaskFormat.CVAT_6, loss=None)
 DEFAULT = RunParams()
 BINARY_TRAIN = RunParams(mode=RunMode.TRAIN, test_mask_format=None)

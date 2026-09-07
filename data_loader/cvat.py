@@ -1,17 +1,15 @@
 """``--mask-format cvat_6`` support: 6-class masks from CVAT 1.1 XML exports.
 
-Directory convention for source frames is unchanged from ``data_loader.normal``:
-
-    ./data/{dir_name}/          source frames, named "{second}_{frame}.jpg"
+Source-frame directories are Run Parameter Paths interpreted relative to the
+current working directory. Frames are named ``{second}_{frame}.jpg``.
 
 There is no ``{dir_name}_mask`` directory for this format. Instead, one or
-more CVAT ("CVAT for images 1.1") XML export files are passed via
-``--mask-path``. Each ``<image>`` element in those files carries its own
-``subset`` attribute (not the same as its ``<task><name>``, which can differ
-from it -- confirmed against a real export), and that ``subset`` string is
-matched directly against a ``--dirs`` directory name. An image is only used
-as labeled training data if its ``name`` attribute also matches a file
-present in ``./data/{dir_name}/``.
+more CVAT ("CVAT for images 1.1") XML export files are supplied through an
+Annotation Pattern. Each ``<image>`` element carries a ``subset`` attribute
+(not the same as its ``<task><name>``, which can differ), which is matched
+against the basename of a Dataset Directory Pattern result. An image is only
+used as labeled training data if its ``name`` also matches a file in that
+dataset directory.
 
 Shapes are CVAT ``<mask>`` (RLE-encoded, the common case) or ``<polygon>``
 (seen mixed into the same images in real exports); both are rasterized into
@@ -22,7 +20,6 @@ wins -- CVAT's own rendering convention.
 
 from __future__ import annotations
 
-import glob
 import os
 import random
 import xml.etree.ElementTree as ET
@@ -33,7 +30,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from data_loader.normal import DATA_ROOT, _list_images
+from data_loader.normal import _list_images
 
 
 class CvatLabelMap:
@@ -72,7 +69,7 @@ class CvatLabelMap:
     # Foreground classes for the fg/bg collapse shared by --mode eval's
     # alpha-matte output, train/test's fg metrics, and --convert-mask-format
     # binary (see class docstring above for how this relates to BACKGROUND).
-    FOREGROUND_CLASSES = ["pottery", "teapot"]
+    FOREGROUND_CLASSES = ["clay_and_rotator"]
 
     def __init__(self) -> None:
         self._name_to_index = {name: i for i, name in enumerate(self.CLASSES)}
@@ -265,7 +262,7 @@ def _parse_annotations(mask_paths: list[str]) -> dict[str, dict[str, _CvatImageR
             prior_files = files_seen_for_subset.setdefault(subset, set())
             if prior_files and xml_path not in prior_files:
                 print(
-                    f"Warning: subset='{subset}' appears in multiple --mask-path files "
+                    f"Warning: subset='{subset}' appears in multiple Annotation Pattern files "
                     f"({sorted(prior_files)} and '{xml_path}'); merging their image lists"
                 )
             prior_files.add(xml_path)
@@ -273,39 +270,8 @@ def _parse_annotations(mask_paths: list[str]) -> dict[str, dict[str, _CvatImageR
     return by_subset
 
 
-def _resolve_dir_names(dir_names: list[str], data_root: str, subsets: set[str]) -> list[str]:
-    """Wildcard analogue of data_loader.normal._resolve_dir_names for cvat_6.
-
-    A '*' entry is expanded to every directory under data_root matching the
-    pattern that also appears as a subset in the given --mask-path file(s)
-    -- the cvat_6 equivalent of requiring a sibling '{name}_mask' directory.
-    Non-wildcard entries are passed through unchanged.
-    """
-    resolved: list[str] = []
-    seen: set[str] = set()
-
-    for pattern in dir_names:
-        if "*" not in pattern:
-            if pattern not in seen:
-                seen.add(pattern)
-                resolved.append(pattern)
-            continue
-
-        for match in sorted(glob.glob(os.path.join(data_root, pattern))):
-            if not os.path.isdir(match):
-                continue
-            rel_dir_name = os.path.relpath(match, data_root)
-            if os.path.basename(rel_dir_name) not in subsets:
-                continue
-            if rel_dir_name not in seen:
-                seen.add(rel_dir_name)
-                resolved.append(rel_dir_name)
-
-    return resolved
-
-
 def scan_dirs(
-    dir_names: list[str], mask_paths: list[str], data_root: str = DATA_ROOT
+    dir_names: list[str], mask_paths: list[str]
 ) -> list[tuple[str, tuple[_Shape, ...], int, int]]:
     """CVAT-format analogue of data_loader.normal.scan_dirs.
 
@@ -315,18 +281,18 @@ def scan_dirs(
     labeled pairs are used for train/val/test).
     """
     by_subset = _parse_annotations(mask_paths)
-    resolved = _resolve_dir_names(dir_names, data_root, set(by_subset))
-
     labeled: list[tuple[str, tuple[_Shape, ...], int, int]] = []
-    for dir_name in resolved:
-        image_dir = os.path.join(data_root, dir_name)
+    for dir_name in dir_names:
+        image_dir = os.path.normpath(dir_name)
+        if os.path.basename(image_dir).endswith("_mask") or not os.path.isdir(image_dir):
+            continue
         images_on_disk = _list_images(image_dir)
 
-        # `dir_name` may be a full (possibly shell-expanded) path, e.g.
+        # `image_dir` may be a full path, e.g.
         # "/videos/0626/com.oculus.vrshell-...-0"; the CVAT `subset`
         # attribute only ever holds the last path component, so look up
         # by basename rather than the full dir_name.
-        subset_name = os.path.basename(dir_name)
+        subset_name = os.path.basename(image_dir)
         for name, ref in by_subset.get(subset_name, {}).items():
             stem, _ext = os.path.splitext(name)
             image_path = images_on_disk.get(stem)
@@ -384,7 +350,6 @@ def get_train_val_datasets(
     mask_paths: list[str],
     val_ratio: float = 0.2,
     seed: int = 42,
-    data_root: str = DATA_ROOT,
     image_size: tuple[int, int] = (180, 320),
 ):
     """Split labeled (image + CVAT annotation) samples into train/val datasets.
@@ -393,11 +358,11 @@ def get_train_val_datasets(
     held out for validation: ``val_dataset`` is ``None`` and all labeled
     triples are used for training.
     """
-    labeled = scan_dirs(dir_names, mask_paths, data_root=data_root)
+    labeled = scan_dirs(dir_names, mask_paths)
     if not labeled:
         raise ValueError(
-            "No labeled (image + CVAT annotation) pairs found. Check that --mask-path points "
-            "at XML file(s) containing a <image subset=...> matching one of --dirs."
+            "No labeled (image + CVAT annotation) pairs found. Check that the Annotation Pattern points "
+            "at XML file(s) containing a <image subset=...> matching a Dataset Directory Pattern result."
         )
 
     triples = list(labeled)
@@ -417,14 +382,13 @@ def get_train_val_datasets(
 def get_test_dataset(
     dir_names: list[str],
     mask_paths: list[str],
-    data_root: str = DATA_ROOT,
     image_size: tuple[int, int] = (180, 320),
 ):
     """Return a dataset of every labeled (image + CVAT annotation) pair, train and val combined."""
-    labeled = scan_dirs(dir_names, mask_paths, data_root=data_root)
+    labeled = scan_dirs(dir_names, mask_paths)
     if not labeled:
         raise ValueError(
-            "No labeled (image + CVAT annotation) pairs found. Check that --mask-path points "
-            "at XML file(s) containing a <image subset=...> matching one of --dirs."
+            "No labeled (image + CVAT annotation) pairs found. Check that the Annotation Pattern points "
+            "at XML file(s) containing a <image subset=...> matching a Dataset Directory Pattern result."
         )
     return CvatSegmentationDataset(labeled, image_size=image_size)
