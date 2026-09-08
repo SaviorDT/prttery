@@ -110,6 +110,18 @@ class SegmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
+    def image_path(self, index: int) -> str:
+        """Return the source image for a labeled sample."""
+        return self.pairs[index][0]
+
+    def native_target(self, index: int) -> np.ndarray:
+        """Load a binary target without resizing it to the model input."""
+        _image_path, mask_path = self.pairs[index]
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Failed to read mask: {mask_path}")
+        return (mask > 127).astype(np.float32)[np.newaxis, :, :]
+
     def __getitem__(self, index: int):
         image_path, mask_path = self.pairs[index]
 
@@ -146,9 +158,11 @@ class EvalDataset(Dataset):
         self,
         items: list[EvalItem],
         image_size: tuple[int, int] = (180, 320),  # (H, W)
+        strict: bool = False,
     ) -> None:
         self.items = items
         self.height, self.width = image_size
+        self.strict = strict
 
     def __len__(self) -> int:
         return len(self.items)
@@ -158,6 +172,8 @@ class EvalDataset(Dataset):
 
         image = cv2.imread(item.image_path, cv2.IMREAD_COLOR)
         if image is None:
+            if self.strict:
+                raise FileNotFoundError(f"Failed to read image: {item.image_path}")
             # Let the caller skip this frame instead of crashing the whole run.
             return None, item
 

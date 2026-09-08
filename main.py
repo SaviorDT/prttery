@@ -13,8 +13,8 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from data_loader.cvat import CvatLabelMap
 from data_loader.normal import EvalDataset, EvalItem, eval_collate, get_eval_items
+from eval_pipeline import load_eval_model, predict_eval_batch, to_native_eval_prediction
 from mask_formats import get_mask_format
 from param import ACTIVE_RUN, MaskFormat, RunMode
 from outputer.mp4 import close_nvenc_writer, open_nvenc_writer, probe_nvenc_available, write_nvenc_frame, write_video
@@ -92,36 +92,13 @@ def run_eval(
     - ``"eval_mul"``: a colored overlay of each pixel's predicted class (via
       ``outputer.overlay.ClassOverlayRenderer``), always fully opaque.
     """
-    model = model_class(*expected_image_size)
-    model.load(model_path)
-
-    in_height, in_width = model.input_shape[0], model.input_shape[1]
-    if (in_height, in_width) != expected_image_size:
-        raise ValueError(
-            f"checkpoint input size {(in_height, in_width)} does not match profile image_size {expected_image_size}"
-        )
+    model = load_eval_model(model_class, model_path, expected_image_size)
+    in_height, in_width = model.input_shape[:2]
 
     # mask_format, not the wrapper class, is the source of
     # truth for how to interpret a checkpoint's raw output, matching how it's already the
     # source of truth for --mode train/test.
     format_obj = get_mask_format(mask_format)
-    is_multiclass_model = mask_format == "cvat_6"
-
-    # A multi-class model's raw output is (B, num_classes, H, W) softmax
-    # probabilities. --mode eval's output format stays the same alpha-matte
-    # pipeline as the binary models: collapse each pixel to its argmax
-    # class, then to a binary foreground/background decision, treating
-    # CvatLabelMap.FOREGROUND_CLASSES classes as foreground and everything
-    # else (background, and any other class) as background -- see
-    # CvatLabelMap.foreground_indices(), the same definition shared by
-    # --mode test's --convert-mask-format and train/test's fg metrics
-    # (mask_formats.Cvat6Format.background_classes()). Note this makes the
-    # collapse a discrete decision at the model's native resolution (not a
-    # continuous probability), so the alpha edges below lose some of the
-    # smoothing the linear upscale used to give a continuous foreground
-    # probability. --mode eval_mul instead keeps every class distinct (see
-    # its branch below), so this collapse only applies to --mode eval.
-    foreground_class_indices = list(CvatLabelMap().foreground_indices()) if is_multiclass_model else None
 
     # --mode eval_mul: colored overlay of every predicted class, generic
     # across whatever --mask-format says the checkpoint's raw channels mean
@@ -189,33 +166,11 @@ def run_eval(
         frame_paths: list[str] = []
         frame_size: tuple[int, int] | None = None
         for tensors, batch_items, valid_mask in tqdm(loader, desc=dir_name):
-            preds = model.eval(tensors) if tensors is not None else None  # (B, 1, in_H, in_W) probabilities in [0, 1]
-            if preds is not None:
-                # The checkpoint's actual channel count is ground truth; --mask-format is only
-                # a human-supplied claim about it. If they disagree, the collapse below would
-                # silently read the wrong channel as a foreground probability (e.g. reading a
-                # cvat_6 model's raw background-class channel as if it were already a fg
-                # probability) instead of failing loudly, so catch the mismatch here.
-                num_channels = preds.shape[1]
-                expected = "> 1 (cvat_6)" if is_multiclass_model else "1 (binary)"
-                if is_multiclass_model and num_channels <= 1:
-                    raise RuntimeError(
-                        f"--mask-format cvat_6 but '{model_path}' only outputs {num_channels} channel(s) "
-                        f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
-                    )
-                if not is_multiclass_model and num_channels != 1:
-                    raise RuntimeError(
-                        f"--mask-format binary but '{model_path}' outputs {num_channels} channels "
-                        f"(expected {expected}); wrong --model-path, or --mask-format doesn't match this checkpoint"
-                    )
-            if mode == "eval" and is_multiclass_model and preds is not None:
-                class_idx = get_mask_format("cvat_6").raw_output_to_class_index(preds)  # (B, ...) -> (B, H, W) argmax class
-                # (B, H, W) -> (B, 1, H, W) in {0., 1.}: FOREGROUND_CLASSES classes -> 1, else -> 0.
-                preds = np.isin(class_idx, foreground_class_indices)[:, np.newaxis, :, :].astype(np.float32)
-            # mode == "eval_mul": preds stays the raw (B, C, h, w) probabilities untouched here --
-            # each item below resizes its own C channels to full resolution before collapsing, so
-            # the collapse happens at the frame's native resolution instead of the model's small
-            # input resolution (see the per-item branch).
+            preds = (
+                predict_eval_batch(model, tensors, mask_format, model_path)
+                if tensors is not None
+                else None
+            )
 
             valid_idx = 0
             for item, is_valid in zip(batch_items, valid_mask):
@@ -257,13 +212,12 @@ def run_eval(
                     bgra = cv2.cvtColor(composited, cv2.COLOR_BGR2BGRA)
                     bgra[:, :, 3] = 255  # always opaque -- outputer.mp4's black-composite is then a no-op
                 else:
-                    # Upscale the continuous probability map (not an already-binarized
-                    # mask) with linear interpolation for a smooth edge contour, then
-                    # threshold so alpha values stay strictly 0/255.
-                    prob = cv2.resize(
-                        pred[0].astype(np.float32), (orig_width, orig_height), interpolation=cv2.INTER_LINEAR
+                    # EVAL_TEST uses this exact final mask transformation before
+                    # comparing the prediction with native-resolution ground truth.
+                    native_prediction = to_native_eval_prediction(
+                        pred, mask_format, (orig_height, orig_width)
                     )
-                    mask = np.where(prob > 0.5, np.uint8(255), np.uint8(0))
+                    mask = (native_prediction.mask * 255).astype(np.uint8)
 
                     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)  # original resolution, not resized
                     bgra[:, :, 3] = mask
@@ -364,6 +318,16 @@ def main() -> None:
                 loss_name=params.loss.value, early_stop_check=params.early_stop_check.value if params.early_stop_check else None,
                 boundary_tolerance_px=params.boundary_tolerance_px,
             )
+    elif params.mode is RunMode.EVAL_TEST:
+        from train.normal import run_eval_test
+        run_eval_test(
+            dirs=dirs, mask_paths=mask_paths, model_class=params.model_class,
+            model_path=model_path, batch_size=params.batch_size,
+            test_mask_format=params.test_mask_format.value,
+            convert_mask_format=params.convert_mask_format.value if params.convert_mask_format else None,
+            image_size=image_size,
+            boundary_tolerance_px=params.boundary_tolerance_px,
+        )
     elif params.mode is RunMode.TEST:
         if params.mask_format is MaskFormat.CVAT_6:
             from train.multiclass import run_test
@@ -375,6 +339,7 @@ def main() -> None:
             test_mask_format=params.test_mask_format.value,
             convert_mask_format=params.convert_mask_format.value if params.convert_mask_format else None,
             image_size=image_size,
+            boundary_tolerance_px=params.boundary_tolerance_px,
         )
     else:
         run_eval(

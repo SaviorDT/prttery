@@ -21,6 +21,7 @@ class RunMode(Enum):
     TRAIN = "train"
     EVAL = "eval"
     EVAL_MUL = "eval_mul"
+    EVAL_TEST = "eval_test"
     TEST = "test"
 
 
@@ -92,7 +93,7 @@ class RunParams:
     lr_decrease_rate: float = 0.5
     lr_patience: int = 3
     split_seed: int | None = None
-    mask_format: MaskFormat = MaskFormat.BINARY
+    mask_format: MaskFormat = MaskFormat.CVAT_6
     mask_paths: tuple[Path, ...] = (Path("/videos/cvat_masks/*"),)
     test_mask_format: MaskFormat | None = MaskFormat.CVAT_6
     convert_mask_format: MaskFormat | None = MaskFormat.BINARY
@@ -187,6 +188,9 @@ class RunParams:
         if not self.dirs:
             raise ValueError("dirs is required: set the source directory paths in the selected profile in param.py")
         is_multiclass = self.model_class is UNetResNet18Mul
+        is_test_mode = self.mode in (RunMode.TEST, RunMode.EVAL_TEST)
+        if self.mode is RunMode.EVAL_TEST and is_multiclass:
+            raise ValueError("EVAL_TEST currently supports binary models only")
         if self.mode is RunMode.TRAIN:
             if is_multiclass and self.effective_mask_format is not MaskFormat.CVAT_6:
                 raise ValueError("UNetResNet18Mul requires CVAT_6 ground truth with no conversion")
@@ -211,17 +215,17 @@ class RunParams:
         if self.freeze_encoder and self.unfreeze_patience > self.patience:
             raise ValueError("unfreeze_patience must be <= patience so early stopping cannot prevent unfreezing")
 
-        if self.test_mask_format is not None and self.mode is not RunMode.TEST:
-            raise ValueError("test_mask_format is only used with mode=TEST")
+        if self.test_mask_format is not None and not is_test_mode:
+            raise ValueError("test_mask_format is only used with TEST or EVAL_TEST")
         if self.test_mask_format is None:
             self.test_mask_format = MaskFormat.BINARY
-        if self.convert_mask_format is not None and self.mode not in (RunMode.TRAIN, RunMode.TEST):
-            raise ValueError("convert_mask_format is only used with mode=TRAIN or mode=TEST")
-        if self.mode is RunMode.TEST and self.test_mask_format is not self.mask_format and self.convert_mask_format is None:
+        if self.convert_mask_format is not None and self.mode is not RunMode.TRAIN and not is_test_mode:
+            raise ValueError("convert_mask_format is only used with TRAIN, TEST, or EVAL_TEST")
+        if is_test_mode and self.test_mask_format is not self.mask_format and self.convert_mask_format is None:
             raise ValueError("test_mask_format differing from mask_format requires convert_mask_format")
 
         needs_cvat = (self.mode is RunMode.TRAIN and self.mask_format is MaskFormat.CVAT_6) or (
-            self.mode is RunMode.TEST and self.test_mask_format is MaskFormat.CVAT_6
+            is_test_mode and self.test_mask_format is MaskFormat.CVAT_6
         )
         if needs_cvat and not self.mask_paths:
             raise ValueError("CVAT ground truth requires mask_paths")
@@ -265,8 +269,10 @@ class CopyMaskParams:
 # Fill ``dirs`` with your dataset directory paths before running main.py.
 CVAT_MULTICLASS = RunParams(model_class=UNetResNet18Mul, mask_format=MaskFormat.CVAT_6, loss=None)
 DEFAULT = RunParams()
-BINARY_TRAIN = RunParams(mode=RunMode.TRAIN, test_mask_format=None)
+BINARY_TRAIN = RunParams(mode=RunMode.TRAIN, test_mask_format=None, loss=BinaryLoss.BCE, early_stop_check=None)
 BINARY_TEST = RunParams(mode=RunMode.TEST, preprocessors=())
-BINARY_EVAL = RunParams(model_path=Path("./result/model.onnx"), output_dir=Path("/videos/results2/"), mode=RunMode.EVAL, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
-ACTIVE_RUN = BINARY_EVAL
+BINARY_EVAL_TEST = RunParams(mode=RunMode.EVAL_TEST, preprocessors=())
+BINARY_EVAL = RunParams(model_path=Path("./result/model180.onnx"), output_dir=Path("/videos/results/"), mode=RunMode.EVAL, mask_format=MaskFormat.BINARY, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
+BINARY_EVAL_MUL = RunParams(model_path=Path("./result/model.onnx"), output_dir=Path("/videos/results2/"), mode=RunMode.EVAL_MUL, mask_format=MaskFormat.BINARY, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
+ACTIVE_RUN = BINARY_TRAIN
 ACTIVE_COPY_MASK = CopyMaskParams()

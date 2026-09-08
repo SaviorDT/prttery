@@ -327,6 +327,15 @@ class CvatSegmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.triples)
 
+    def image_path(self, index: int) -> str:
+        """Return the source image for a labeled sample."""
+        return self.triples[index][0]
+
+    def native_target(self, index: int) -> np.ndarray:
+        """Render a class-index target at the annotation canvas size."""
+        _image_path, shapes, xml_width, xml_height = self.triples[index]
+        return render_mask(shapes, xml_height, xml_width, self.label_map)
+
     def __getitem__(self, index: int):
         image_path, shapes, xml_width, xml_height = self.triples[index]
 

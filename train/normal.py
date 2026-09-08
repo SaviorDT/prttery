@@ -15,7 +15,11 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from data_loader.normal import get_test_dataset, get_train_val_datasets
+from data_loader.normal import (
+    EvalDataset, EvalItem, eval_collate, get_test_dataset,
+    get_train_val_datasets,
+)
+from eval_pipeline import load_eval_model, predict_eval_batch, to_native_eval_prediction
 from mask_formats import binary_confusion_metrics, get_mask_format, to_binary
 from models.base import ModelBase
 from train import freezing
@@ -57,10 +61,31 @@ def _bce_loss(pred_prob: np.ndarray, target: np.ndarray) -> float:
     return float(-np.mean(target * np.log(p) + (1 - target) * np.log(1 - p)))
 
 
-def _boundary_f1(pred_prob: np.ndarray, target: np.ndarray, tolerance_px: int) -> float:
-    """Boundary F1 for binary batches, using a pixel-distance tolerance."""
+def _boundary_mask_2d(mask: np.ndarray) -> np.ndarray:
+    """Normalize a mask with an optional singleton channel to two dimensions."""
+    value = np.asarray(mask)
+    if value.ndim == 3 and value.shape[0] == 1:
+        value = value[0]
+    if value.ndim != 2:
+        raise ValueError("boundary metrics require two-dimensional masks")
+    return value
+
+
+def _boundary_f1_items(
+    predictions: list[np.ndarray],
+    targets: list[np.ndarray],
+    tolerance_px: int,
+) -> float:
+    """Boundary F1 for binary masks, including differently sized images."""
+    if len(predictions) != len(targets):
+        raise ValueError("boundary prediction and target batch sizes differ")
+
     total_precision_hits = total_pred = total_recall_hits = total_true = 0
-    for pred_item, target_item in zip(pred_prob[:, 0], target[:, 0]):
+    for pred_item, target_item in zip(predictions, targets, strict=True):
+        pred_item = _boundary_mask_2d(pred_item)
+        target_item = _boundary_mask_2d(target_item)
+        if pred_item.shape != target_item.shape:
+            raise ValueError("boundary prediction and target shapes differ")
         pred = (pred_item > 0.5).astype(np.uint8)
         truth = (target_item > 0.5).astype(np.uint8)
         kernel = np.ones((3, 3), np.uint8)
@@ -81,6 +106,11 @@ def _boundary_f1(pred_prob: np.ndarray, target: np.ndarray, tolerance_px: int) -
     precision = total_precision_hits / max(total_pred, 1)
     recall = total_recall_hits / max(total_true, 1)
     return 2 * precision * recall / max(precision + recall, 1e-7)
+
+
+def _boundary_f1(pred_prob: np.ndarray, target: np.ndarray, tolerance_px: int) -> float:
+    """Boundary F1 for an equal-size binary batch."""
+    return _boundary_f1_items(list(pred_prob[:, 0]), list(target[:, 0]), tolerance_px)
 
 
 def _native_boundary_f1(predictions: np.ndarray, dataset, tolerance_px: int) -> float:
@@ -116,6 +146,119 @@ def _average_metrics(metric_dicts: list[dict]) -> dict:
 def _format_metrics(prefix: str, loss: float | None, metrics: dict) -> str:
     parts = ([f"loss={loss:.4f}"] if loss is not None else []) + [f"{k}={v:.4f}" for k, v in metrics.items()]
     return f"[{prefix}] " + " ".join(parts)
+
+
+class BinaryTestEvaluator:
+    """Shared batch evaluation and reporting for TEST and EVAL_TEST."""
+
+    def __init__(
+        self,
+        test_mask_format: str,
+        convert_mask_format: str | None,
+        boundary_tolerance_px: int = 2,
+    ) -> None:
+        self.native_format = "binary"
+        self.test_mask_format = test_mask_format
+        self.convert_mask_format = convert_mask_format
+        self.boundary_tolerance_px = boundary_tolerance_px
+        self.losses: list[float] = []
+        self.metrics: list[dict] = []
+
+    def add_batch(
+        self,
+        predictions: np.ndarray | list[np.ndarray],
+        targets: np.ndarray | list[np.ndarray],
+        binary_predictions: list[np.ndarray] | None = None,
+    ) -> None:
+        """Evaluate one inference batch, including variable native image sizes."""
+        prediction_items = list(predictions)
+        target_items = list(targets)
+        if len(prediction_items) != len(target_items):
+            raise ValueError("prediction and target batch sizes differ")
+        if binary_predictions is not None and len(binary_predictions) != len(prediction_items):
+            raise ValueError("binary prediction and probability batch sizes differ")
+
+        probability_flat = np.concatenate(
+            [np.asarray(item, dtype=np.float32).reshape(-1) for item in prediction_items]
+        )
+
+        if self.test_mask_format == self.native_format:
+            target_binary = [
+                np.asarray(item, dtype=np.float32).reshape(-1)
+                for item in target_items
+            ]
+            target_flat = np.concatenate(target_binary)
+            if probability_flat.size != target_flat.size:
+                raise ValueError("prediction and target pixel counts differ")
+            self.losses.append(_bce_loss(probability_flat, target_flat))
+
+            if binary_predictions is None:
+                prediction_flat = (probability_flat > 0.5).astype(np.float32)
+                boundary_predictions = prediction_items
+            else:
+                prediction_flat = np.concatenate(
+                    [np.asarray(item, dtype=np.float32).reshape(-1) for item in binary_predictions]
+                )
+                boundary_predictions = binary_predictions
+            boundary_targets = target_items
+        else:
+            if self.convert_mask_format != "binary":
+                raise ValueError(
+                    f"Unsupported --convert-mask-format '{self.convert_mask_format}'; "
+                    "only 'binary' is supported"
+                )
+            target_format = get_mask_format(self.test_mask_format)
+            converted_targets = []
+            for target in target_items:
+                target_array = np.asarray(target)
+                target_index = target_format.ground_truth_to_class_index(
+                    target_array[np.newaxis, ...]
+                )
+                converted_targets.append(
+                    to_binary(target_index, self.test_mask_format)[0]
+                )
+            target_flat = np.concatenate([item.reshape(-1) for item in converted_targets])
+
+            if binary_predictions is None:
+                native_format = get_mask_format(self.native_format)
+                converted_predictions = []
+                for prediction in prediction_items:
+                    prediction_array = np.asarray(prediction)
+                    if prediction_array.ndim == 2:
+                        prediction_array = prediction_array[np.newaxis, ...]
+                    prediction_index = native_format.raw_output_to_class_index(
+                        prediction_array[np.newaxis, ...]
+                    )
+                    converted_predictions.append(
+                        to_binary(prediction_index, self.native_format)[0].reshape(-1)
+                    )
+                prediction_flat = np.concatenate(converted_predictions)
+                boundary_predictions = prediction_items
+            else:
+                prediction_flat = np.concatenate(
+                    [np.asarray(item, dtype=np.float32).reshape(-1) for item in binary_predictions]
+                )
+                boundary_predictions = binary_predictions
+            boundary_targets = converted_targets
+
+        if prediction_flat.size != target_flat.size:
+            raise ValueError("prediction and target pixel counts differ")
+        metrics = binary_confusion_metrics(prediction_flat, target_flat)
+        metrics["boundary_f1"] = _boundary_f1_items(
+            boundary_predictions,
+            boundary_targets,
+            self.boundary_tolerance_px,
+        )
+        self.metrics.append(metrics)
+
+    def print_report(self, title: str, prefix: str) -> None:
+        loss = float(np.mean(self.losses)) if self.losses else None
+        metrics = _average_metrics(self.metrics)
+        print()
+        print("=" * 60)
+        print(title)
+        print(_format_metrics(prefix, loss, metrics))
+        print("=" * 60)
 
 
 def run(
@@ -336,6 +479,20 @@ def run(
     print(f"Model saved to {model_path}")
 
 
+def _build_binary_test_dataset(
+    dirs: list[str],
+    mask_paths: list[str] | None,
+    test_mask_format: str,
+    image_size: tuple[int, int],
+):
+    if test_mask_format == "binary":
+        return get_test_dataset(dirs, image_size=image_size)
+
+    from data_loader.cvat import get_test_dataset as get_cvat_test_dataset
+
+    return get_cvat_test_dataset(dirs, mask_paths, image_size=image_size)
+
+
 def run_test(
     dirs: list[str],
     model_path: str,
@@ -345,6 +502,7 @@ def run_test(
     test_mask_format: str = "binary",
     convert_mask_format: str | None = None,
     image_size: tuple[int, int] = (180, 320),
+    boundary_tolerance_px: int = 2,
 ) -> None:
     """Evaluate a saved model (native format: binary) against all labeled data
     (train and val combined).
@@ -361,12 +519,7 @@ def run_test(
     """
     native_format = "binary"
 
-    if test_mask_format == native_format:
-        test_dataset = get_test_dataset(dirs, image_size=image_size)
-    else:
-        from data_loader.cvat import get_test_dataset as get_cvat_test_dataset
-
-        test_dataset = get_cvat_test_dataset(dirs, mask_paths, image_size=image_size)
+    test_dataset = _build_binary_test_dataset(dirs, mask_paths, test_mask_format, image_size)
     print(f"Test samples: {len(test_dataset)}")
 
     num_workers = min(4, os.cpu_count() or 1)
@@ -379,35 +532,102 @@ def run_test(
         persistent_workers=num_workers > 0,
     )
 
-    model = model_class()
-    model.load(model_path)
-
-    same_format = test_mask_format == native_format
-    test_losses = []
-    test_metrics = []
+    model = load_eval_model(model_class, model_path, image_size)
+    evaluator = BinaryTestEvaluator(
+        test_mask_format, convert_mask_format, boundary_tolerance_px
+    )
     for x, y in tqdm(test_loader, desc="Test"):
-        pred = model.eval(x)
-        y_np = y.numpy()
+        pred = predict_eval_batch(model, x, native_format, model_path)
+        evaluator.add_batch(pred, y.numpy())
 
-        if same_format:
-            test_losses.append(_bce_loss(pred, y_np))
-            test_metrics.append(compute_metrics(pred, y_np))
-        else:
-            if convert_mask_format != "binary":
-                raise ValueError(f"Unsupported --convert-mask-format '{convert_mask_format}'; only 'binary' is supported")
-            # Loss isn't meaningful across formats (the ground truth doesn't
-            # match what the model was trained to predict), so only metrics
-            # are reported in this branch.
-            pred_class_idx = get_mask_format(native_format).raw_output_to_class_index(pred)
-            gt_class_idx = get_mask_format(test_mask_format).ground_truth_to_class_index(y_np)
-            pred_binary = to_binary(pred_class_idx, native_format)
-            gt_binary = to_binary(gt_class_idx, test_mask_format)
-            test_metrics.append(binary_confusion_metrics(pred_binary, gt_binary))
+    evaluator.print_report("Test Metrics", "test")
 
-    test_metric_avg = _average_metrics(test_metrics)
-    test_loss = float(np.mean(test_losses)) if test_losses else None
-    print()
-    print("=" * 60)
-    print("Test Metrics")
-    print(_format_metrics("test", test_loss, test_metric_avg))
-    print("=" * 60)
+
+def run_eval_test(
+    dirs: list[str],
+    model_path: str,
+    model_class: type[ModelBase],
+    batch_size: int = 8,
+    mask_paths: list[str] | None = None,
+    test_mask_format: str = "binary",
+    convert_mask_format: str | None = None,
+    image_size: tuple[int, int] = (180, 320),
+    boundary_tolerance_px: int = 2,
+) -> None:
+    """Evaluate the exact EVAL output transformation against native targets."""
+    native_format = "binary"
+    test_dataset = _build_binary_test_dataset(
+        dirs, mask_paths, test_mask_format, image_size
+    )
+    print(f"Eval test samples: {len(test_dataset)}")
+
+    items = [
+        EvalItem(image_path=test_dataset.image_path(index), second=0, frame=index)
+        for index in range(len(test_dataset))
+    ]
+    eval_dataset = EvalDataset(items, image_size=image_size, strict=True)
+    num_workers = min(4, os.cpu_count() or 1)
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+        collate_fn=eval_collate,
+    )
+
+    model = load_eval_model(model_class, model_path, image_size)
+    evaluator = BinaryTestEvaluator(
+        test_mask_format, convert_mask_format, boundary_tolerance_px
+    )
+    sample_index = 0
+
+    for tensors, batch_items, valid_mask in tqdm(eval_loader, desc="Eval Test"):
+        if tensors is None or not all(valid_mask):
+            failed = next(
+                item.image_path
+                for item, is_valid in zip(batch_items, valid_mask)
+                if not is_valid
+            )
+            raise FileNotFoundError(f"Failed to read image: {failed}")
+
+        predictions = predict_eval_batch(model, tensors, native_format, model_path)
+        native_probabilities = []
+        native_masks = []
+        native_targets = []
+
+        for prediction, item in zip(predictions, batch_items, strict=True):
+            expected_path = test_dataset.image_path(sample_index)
+            if item.image_path != expected_path:
+                raise RuntimeError("eval-test dataset order changed during inference")
+
+            target = test_dataset.native_target(sample_index)
+            image = cv2.imread(item.image_path, cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(f"Failed to read image: {item.image_path}")
+            image_size_native = image.shape[:2]
+            target_size_native = target.shape[-2:]
+            if image_size_native != target_size_native:
+                raise ValueError(
+                    f"Image '{item.image_path}' has size {image_size_native}, "
+                    f"but its annotation has size {target_size_native}"
+                )
+
+            native_prediction = to_native_eval_prediction(
+                prediction, native_format, image_size_native
+            )
+            native_probabilities.append(native_prediction.probability[np.newaxis, :, :])
+            native_masks.append(native_prediction.mask)
+            native_targets.append(target)
+            sample_index += 1
+
+        evaluator.add_batch(
+            native_probabilities,
+            native_targets,
+            binary_predictions=native_masks,
+        )
+
+    if sample_index != len(test_dataset):
+        raise RuntimeError(f"evaluated {sample_index} samples, expected {len(test_dataset)}")
+    evaluator.print_report("Eval Test Metrics", "eval_test")
