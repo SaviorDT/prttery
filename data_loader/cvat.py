@@ -1,7 +1,8 @@
 """``--mask-format cvat_6`` support: 6-class masks from CVAT 1.1 XML exports.
 
 Source-frame directories are Run Parameter Paths interpreted relative to the
-current working directory. Frames are named ``{second}_{frame}.jpg``.
+current working directory. Frames are named ``{second}_{frame}.jpg``,
+``{second}_{frame}.jpeg``, or ``{second}_{frame}.png`` (case-insensitive).
 
 There is no ``{dir_name}_mask`` directory for this format. Instead, one or
 more CVAT ("CVAT for images 1.1") XML export files are supplied through an

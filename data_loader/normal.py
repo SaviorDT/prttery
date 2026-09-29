@@ -6,6 +6,10 @@ module and are interpreted relative to the current working directory.
 
 Only images that have a matching mask are used as labeled training data; all
 images (labeled or not) are candidates for the eval pipeline.
+
+Image inputs accept JPEG (`.jpg`/`.jpeg`) and PNG (`.png`), including
+uppercase extensions. They are decoded as BGR with `cv2.IMREAD_COLOR` so
+source alpha channels are not part of the model input or eval output.
 """
 
 from __future__ import annotations

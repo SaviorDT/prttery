@@ -25,9 +25,9 @@ from outputer.overlay import ClassOverlayRenderer
 # waiting to be composited with their corresponding GPU-computed mask.
 ORIGINAL_IMAGE_QUEUE_SIZE = 500
 
-# Same backpressure idea, but for BGRA frames waiting to be webp-encoded by the writer pool.
-WEBP_QUEUE_SIZE = 500
-WEBP_WRITER_THREADS = 4
+# Same backpressure idea, but for BGRA frames waiting to be PNG-encoded by the writer pool.
+PNG_QUEUE_SIZE = 500
+PNG_WRITER_THREADS = 4
 
 # Models whose output is a per-pixel softmax over multiple classes (not a
 # single-channel sigmoid). Drives --mask-format validation (every mode requires
@@ -59,15 +59,15 @@ def _read_original_images(items: list[EvalItem], q: "queue.Queue[tuple[EvalItem,
         q.put((item, image))
 
 
-def _webp_writer(q: "queue.Queue[tuple[str, np.ndarray] | None]") -> None:
-    """Worker-thread consumer: cv2.imwrite releases the GIL, so several of these run truly in parallel."""
+def _png_writer(q: "queue.Queue[tuple[str, np.ndarray] | None]") -> None:
+    """Write lossless BGRA PNGs in worker threads."""
     while True:
         job = q.get()
         if job is None:
             q.task_done()
             return
         out_path, bgra = job
-        if not cv2.imwrite(out_path, bgra, [cv2.IMWRITE_WEBP_QUALITY, 95]):
+        if not cv2.imwrite(out_path, bgra, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             tqdm.write(f"Failed to write {out_path}, skipping frame")
         q.task_done()
 
@@ -83,7 +83,7 @@ def run_eval(
     expected_image_size: tuple[int, int] = (180, 320),
 ) -> None:
     """Shared pipeline for ``--mode eval`` and ``--mode eval_mul`` -- same
-    background reader thread, DataLoader loop, webp writer pool, and
+    background reader thread, DataLoader loop, PNG writer pool, and
     NVENC/video assembly either way. ``mode`` only switches the per-frame
     compositing step (see the two branches inside the loop below):
 
@@ -120,13 +120,13 @@ def run_eval(
     num_workers = min(4, os.cpu_count() or 1)
 
     # Probed once for the whole run: hardware capability doesn't change mid-run, and a failed
-    # probe means every directory falls back to the CPU (read-webp-then-encode) path uniformly.
+    # probe means every directory falls back to the CPU (read-PNG-then-encode) path uniformly.
     nvenc_ok = probe_nvenc_available()
     print(f"NVENC hardware video encoding: {'available' if nvenc_ok else 'unavailable, falling back to CPU encoding'}")
 
-    webp_queue: "queue.Queue[tuple[str, np.ndarray] | None]" = queue.Queue(maxsize=WEBP_QUEUE_SIZE)
-    webp_threads = [threading.Thread(target=_webp_writer, args=(webp_queue,), daemon=True) for _ in range(WEBP_WRITER_THREADS)]
-    for t in webp_threads:
+    png_queue: "queue.Queue[tuple[str, np.ndarray] | None]" = queue.Queue(maxsize=PNG_QUEUE_SIZE)
+    png_threads = [threading.Thread(target=_png_writer, args=(png_queue,), daemon=True) for _ in range(PNG_WRITER_THREADS)]
+    for t in png_threads:
         t.start()
 
     # Finalizing a directory's NVENC encode (stdin.close + wait) runs here so the next
@@ -222,13 +222,12 @@ def run_eval(
                     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)  # original resolution, not resized
                     bgra[:, :, 3] = mask
 
-                # Lossy WebP (with alpha preserved): far smaller than lossless PNG
-                # (roughly an order of magnitude on photographic content) while
-                # staying visually clean at this quality level. Handed off to the
-                # writer pool instead of encoded inline, so the GPU pipeline isn't
-                # stalled waiting on disk + codec time.
-                out_path = os.path.join(out_dir, f"{item.second}_{item.frame}.webp")
-                webp_queue.put((out_path, bgra))
+                # Lossless PNG preserves the model-generated foreground alpha and
+                # every BGR pixel. Source-image alpha is intentionally discarded
+                # by all input reads using cv2.IMREAD_COLOR. Hand the frame to
+                # the writer pool so the GPU pipeline is not stalled by codec I/O.
+                out_path = os.path.join(out_dir, f"{item.second}_{item.frame}.png")
+                png_queue.put((out_path, bgra))
                 frame_paths.append(out_path)
 
                 if nvenc_ok:
@@ -245,17 +244,17 @@ def run_eval(
             video_finalize_threads.append(finalize_thread)
             print(f"[{dir_name}] {len(frame_paths)} frames queued, encoding {video_path} in background (fps={fps})")
         else:
-            # Webp writes are shared with future directories' work too, but nothing for a
+            # PNG writes are shared with future directories' work too, but nothing for a
             # later directory has been queued yet at this point in the (sequential) loop,
             # so this only waits for frames belonging to dir_name.
-            webp_queue.join()
+            png_queue.join()
             write_video(frame_paths, video_path, fps, frame_size)
             print(f"[{dir_name}] wrote {len(frame_paths)} frames, video saved to {video_path} (fps={fps})")
 
-    webp_queue.join()
-    for _ in webp_threads:
-        webp_queue.put(None)
-    for t in webp_threads:
+    png_queue.join()
+    for _ in png_threads:
+        png_queue.put(None)
+    for t in png_threads:
         t.join()
     for t in video_finalize_threads:
         t.join()
