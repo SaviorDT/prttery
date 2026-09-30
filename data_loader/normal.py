@@ -25,7 +25,9 @@ import torch
 from torch.utils.data import Dataset
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-FRAME_NAME_RE = re.compile(r"^(\d+)_(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
+FRAME_NAME_RE = re.compile(r"\.(jpg|jpeg|png)$", re.IGNORECASE)
+LEGACY_FRAME_NAME_RE = re.compile(r"^(\d+)_(\d+)\.(jpg|jpeg|png)$", re.IGNORECASE)
+FILENAME_ORDERED_FPS = 30.0
 
 
 @dataclass(frozen=True)
@@ -33,21 +35,34 @@ class EvalItem:
     image_path: str
     second: int
     frame: int
+    output_stem: str | None = None
+    fps: float | None = None
 
 
-def _list_images(dir_path: str) -> dict:
+def _list_images(dir_path: str, *, reject_duplicate_stems: bool = False) -> dict[str, str]:
     """Return {stem: full_path} for every image file directly inside dir_path."""
-    result = {}
+    result: dict[str, str] = {}
+    stems_by_casefold: dict[str, str] = {}
     if not os.path.isdir(dir_path):
         return result
     for name in os.listdir(dir_path):
         stem, ext = os.path.splitext(name)
         if ext.lower() in IMAGE_EXTENSIONS:
-            result[stem] = os.path.join(dir_path, name)
+            image_path = os.path.join(dir_path, name)
+            if reject_duplicate_stems:
+                folded_stem = stem.casefold()
+                previous_path = stems_by_casefold.get(folded_stem)
+                if previous_path is not None:
+                    raise ValueError(
+                        f"Duplicate image stem in '{dir_path}': "
+                        f"'{previous_path}' and '{image_path}'"
+                    )
+                stems_by_casefold[folded_stem] = image_path
+            result[stem] = image_path
     return result
 
 
-def scan_dirs(dir_names: list[str]):
+def scan_dirs(dir_names: list[str], *, validate_unique_stems: bool = False):
     """Scan source-frame directories already expanded by RunParams validation.
 
     Entries that resolve to something other than a genuine source-frame
@@ -60,7 +75,9 @@ def scan_dirs(dir_names: list[str]):
     labeled_pairs: list[(image_path, mask_path)]
         Every image that has a matching mask, used for train/val.
     all_images: dict[str, list[EvalItem]]
-        For each dir_name, every image found (labeled or not), used for eval.
+        For each dir_name, images are represented as legacy time-based frames
+        when possible, otherwise sorted by filename with a fixed FPS. Only
+        non-empty image groups are included.
     """
     labeled_pairs: list[tuple[str, str]] = []
     all_images: dict[str, list[EvalItem]] = {}
@@ -76,7 +93,7 @@ def scan_dirs(dir_names: list[str]):
         if os.path.basename(image_dir).endswith("_mask") or not os.path.isdir(image_dir):
             continue
 
-        images = _list_images(image_dir)
+        images = _list_images(image_dir, reject_duplicate_stems=validate_unique_stems)
         masks = _list_images(mask_dir)
 
         for stem, mask_path in masks.items():
@@ -87,15 +104,54 @@ def scan_dirs(dir_names: list[str]):
                 )
             labeled_pairs.append((image_path, mask_path))
 
-        items = []
-        for stem, image_path in images.items():
-            match = FRAME_NAME_RE.match(os.path.basename(image_path))
-            if not match:
-                continue
-            second, frame = int(match.group(1)), int(match.group(2))
-            items.append(EvalItem(image_path=image_path, second=second, frame=frame))
-        items.sort(key=lambda it: (it.second, it.frame))
-        all_images[dir_name] = items
+        image_paths = [
+            path
+            for path in images.values()
+            if FRAME_NAME_RE.search(os.path.basename(path))
+        ]
+        legacy_matches = [
+            LEGACY_FRAME_NAME_RE.match(os.path.basename(path))
+            for path in image_paths
+        ]
+        if image_paths and all(match is not None for match in legacy_matches):
+            items = [
+                EvalItem(
+                    image_path=path,
+                    second=int(match.group(1)),
+                    frame=int(match.group(2)),
+                    output_stem=f"{int(match.group(1))}_{int(match.group(2))}",
+                )
+                for path, match in zip(image_paths, legacy_matches)
+            ]
+            items.sort(key=lambda it: (it.second, it.frame))
+        else:
+            image_paths.sort(
+                key=lambda path: (os.path.basename(path).casefold(), os.path.basename(path))
+            )
+            items = [
+                EvalItem(
+                    image_path=path,
+                    second=0,
+                    frame=index,
+                    output_stem=os.path.splitext(os.path.basename(path))[0],
+                    fps=FILENAME_ORDERED_FPS,
+                )
+                for index, path in enumerate(image_paths)
+            ]
+        if validate_unique_stems:
+            output_stems: dict[str, str] = {}
+            for item in items:
+                output_stem = item.output_stem or f"{item.second}_{item.frame}"
+                folded_stem = output_stem.casefold()
+                previous_path = output_stems.get(folded_stem)
+                if previous_path is not None:
+                    raise ValueError(
+                        f"Duplicate eval output stem in '{image_dir}': "
+                        f"'{previous_path}' and '{item.image_path}'"
+                    )
+                output_stems[folded_stem] = item.image_path
+        if items:
+            all_images[dir_name] = items
 
     return labeled_pairs, all_images
 
@@ -253,6 +309,6 @@ def get_test_dataset(
 
 
 def get_eval_items(dir_names: list[str]) -> dict:
-    """Return {dir_name: [EvalItem, ...]} sorted by (second, frame)."""
-    _, all_images = scan_dirs(dir_names)
+    """Return eval items, validating output stem uniqueness for eval only."""
+    _, all_images = scan_dirs(dir_names, validate_unique_stems=True)
     return all_images

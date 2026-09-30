@@ -159,7 +159,7 @@ def run_eval(
         reader_thread = threading.Thread(target=_read_original_images, args=(items, original_queue), daemon=True)
         reader_thread.start()
 
-        fps = _compute_fps([item.second for item in items])
+        fps = items[0].fps if items[0].fps is not None else _compute_fps([item.second for item in items])
         video_path = os.path.join(output_dir, f"{os.path.basename(dir_name)}.mp4")
         nvenc_proc = None  # opened lazily below, once the first valid frame reveals frame_size
 
@@ -226,7 +226,10 @@ def run_eval(
                 # every BGR pixel. Source-image alpha is intentionally discarded
                 # by all input reads using cv2.IMREAD_COLOR. Hand the frame to
                 # the writer pool so the GPU pipeline is not stalled by codec I/O.
-                out_path = os.path.join(out_dir, f"{item.second}_{item.frame}.png")
+                output_stem = item.output_stem
+                if output_stem is None:
+                    output_stem = f"{item.second}_{item.frame}"
+                out_path = os.path.join(out_dir, f"{output_stem}.png")
                 png_queue.put((out_path, bgra))
                 frame_paths.append(out_path)
 
