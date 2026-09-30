@@ -83,7 +83,7 @@ class RunParams:
     height: int = 576
     width: int = 1024
     epochs: int = 100
-    batch_size: int = 8
+    batch_size: int = 4
     lr: float = 1e-3
     output_dir: Path = Path("./result/")
     model_path: Path | None = None
@@ -97,14 +97,14 @@ class RunParams:
     mask_paths: tuple[Path, ...] = (Path("/videos/cvat_masks/*"),)
     test_mask_format: MaskFormat | None = MaskFormat.CVAT_6
     convert_mask_format: MaskFormat | None = MaskFormat.BINARY
-    preprocessors: tuple[type[PreprocessorBase], ...] = (PREPROCESSOR_REGISTRY["copy_paste"],)
+    preprocessors: tuple[type[PreprocessorBase], ...] = ()
     copy_paste_count: int | None = 40
     copy_paste_seed: int | None = None
     freeze_encoder: bool | None = True
     unfreeze_patience: int = 4
     encoder_lr_factor: float = 0.1
     loss: BinaryLoss | None = BinaryLoss.BCE_DICE
-    early_stop_check: MonitoringCriterion | None = MonitoringCriterion.DICE
+    early_stop_check: MonitoringCriterion | None = MonitoringCriterion.BOUNDARY_F1
     boundary_tolerance_px: int = 2
 
     @property
@@ -266,13 +266,46 @@ class CopyMaskParams:
         self.validate_rules()
 
 
+@dataclass
+class ConvertMaskParams:
+    """Settings for converting CVAT 6-class annotations to JPG masks."""
+
+    mask_paths: tuple[Path, ...] = (Path("./masks/cvat_masks/*.xml"),)
+    output_dir: Path = Path("./masks/converted_masks")
+    foreground_classes: tuple[str, ...] = ("clay_and_rotator","pottery","teapot","rotate_plate","rotate_medal")
+
+    def validate_values(self) -> None:
+        if not isinstance(self.mask_paths, tuple) or not all(isinstance(path, Path) for path in self.mask_paths):
+            raise ValueError("mask_paths must be a tuple of pathlib.Path values")
+        if not isinstance(self.output_dir, Path):
+            raise ValueError("output_dir must be a pathlib.Path value")
+        if not isinstance(self.foreground_classes, tuple) or not all(
+            isinstance(name, str) for name in self.foreground_classes
+        ):
+            raise ValueError("foreground_classes must be a tuple of class-name strings")
+        if any(not name for name in self.foreground_classes):
+            raise ValueError("foreground_classes cannot contain empty class names")
+
+        expanded = _expand_path_patterns(self.mask_paths, "mask_paths")
+        self.mask_paths = tuple(sorted(expanded, key=str))
+        if not self.mask_paths:
+            raise ValueError("mask_paths must contain at least one XML file")
+        for path in self.mask_paths:
+            if not path.is_file():
+                raise ValueError(f"mask path is not a file: {path}")
+
+    def validate(self) -> None:
+        self.validate_values()
+
+
 # Fill ``dirs`` with your dataset directory paths before running main.py.
 CVAT_MULTICLASS = RunParams(model_class=UNetResNet18Mul, mask_format=MaskFormat.CVAT_6, loss=None)
 DEFAULT = RunParams()
-BINARY_TRAIN = RunParams(mode=RunMode.TRAIN, test_mask_format=None, loss=BinaryLoss.BCE, early_stop_check=None)
+BINARY_TRAIN = RunParams(dirs=(Path("/videos/0816/*"),Path("/videos/0626/*"),Path("/videos/0612/*")),mode=RunMode.TRAIN, test_mask_format=None, early_stop_check=MonitoringCriterion.BOUNDARY_F1)
 BINARY_TEST = RunParams(mode=RunMode.TEST, preprocessors=())
-BINARY_EVAL_TEST = RunParams(mode=RunMode.EVAL_TEST, preprocessors=())
+BINARY_EVAL_TEST = RunParams(mode=RunMode.EVAL_TEST, preprocessors=(), model_path=Path("./result/model8687.onnx"))
 BINARY_EVAL = RunParams(model_path=Path("./result/model180.onnx"), output_dir=Path("/videos/results/"), mode=RunMode.EVAL, mask_format=MaskFormat.BINARY, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
-BINARY_EVAL_MUL = RunParams(model_path=Path("./result/model.onnx"), output_dir=Path("/videos/results2/"), mode=RunMode.EVAL_MUL, mask_format=MaskFormat.BINARY, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
-ACTIVE_RUN = BINARY_TRAIN
+BINARY_EVAL_MUL = RunParams(dirs=(Path("/videos/0924/test"),), model_path=Path("./result/model.onnx"), output_dir=Path("/videos/results_mul/"), mode=RunMode.EVAL_MUL, mask_format=MaskFormat.BINARY, test_mask_format=None, convert_mask_format=None, mask_paths=(), preprocessors=())
+ACTIVE_RUN = BINARY_EVAL_MUL
 ACTIVE_COPY_MASK = CopyMaskParams()
+ACTIVE_CONVERT_MASK = ConvertMaskParams()
